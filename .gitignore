@@ -1,3 +1,8 @@
-venv
+﻿venv/
 .env
 gsheet.json
+.amo_tokens.json
+.sync_state.json
+__pycache__/
+*.pyc
+data.xlsx
