@@ -121,6 +121,9 @@ class Config:
     AMO_REQUEST_DELAY_SEC = float(os.getenv("AMO_REQUEST_DELAY_SEC", "0.2"))
     # How long (seconds) the Staff sheet mapping is cached before re-fetching.
     STAFF_CACHE_TTL_SEC = int(os.getenv("STAFF_CACHE_TTL_SEC", "300"))
+    # If the same (lead_id, status_id) webhook arrives again within this window, skip it.
+    # Prevents repeated AMO API calls caused by amoCRM’s own webhook retry logic.
+    WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("WEBHOOK_DEDUP_TTL_SEC", "60"))
 
 
 def require_env() -> None:
@@ -602,9 +605,29 @@ class SyncService:
         self.pipeline_id_to_name: Dict[int, str] = {}
         self.status_id_to_display_name: Dict[int, str] = {}
         self.users_map: Dict[int, str] = {}
+        # Deduplication cache: maps "lead_id:status_id" -> timestamp of last processing
+        self._webhook_dedup: Dict[str, float] = {}
+        self._dedup_lock = threading.Lock()
         self._load_structure_mappings()
         self._load_users()
         self._print_config_warnings()
+
+    def _is_duplicate_webhook(self, lead_id: str, status_id: int) -> bool:
+        """Return True if this (lead_id, status_id) was already processed within WEBHOOK_DEDUP_TTL_SEC.
+        Also evicts stale entries to prevent unbounded memory growth.
+        """
+        key = f"{lead_id}:{status_id}"
+        now = time.time()
+        ttl = self.cfg.WEBHOOK_DEDUP_TTL_SEC
+        with self._dedup_lock:
+            # Evict entries older than 2x TTL
+            stale = [k for k, ts in self._webhook_dedup.items() if now - ts > ttl * 2]
+            for k in stale:
+                del self._webhook_dedup[k]
+            if key in self._webhook_dedup and now - self._webhook_dedup[key] < ttl:
+                return True
+            self._webhook_dedup[key] = now
+            return False
 
     def _load_users(self) -> None:
         try:
@@ -722,6 +745,7 @@ class SyncService:
         trigger_matches = 0
         terminal_matches = 0
         skipped_no_id = 0
+        skipped_duplicate = 0
         skipped_status_mismatch = 0
         skipped_too_old = 0
         seen_status_ids: List[int] = []
@@ -736,6 +760,11 @@ class SyncService:
 
             webhook_status_id = int(lead.get("status_id", 0) or 0)
             seen_status_ids.append(webhook_status_id)
+
+            # Deduplicate: amoCRM retries webhooks — skip if we already handled this exact event
+            if self._is_duplicate_webhook(lead_id, webhook_status_id):
+                skipped_duplicate += 1
+                continue
 
             is_trigger = webhook_status_id in self.trigger_status_ids
             is_terminal = str(webhook_status_id) in self.terminal_status_id_to_name
@@ -806,6 +835,7 @@ class SyncService:
             "trigger_matches": trigger_matches,
             "terminal_matches": terminal_matches,
             "skipped_no_id": skipped_no_id,
+            "skipped_duplicate": skipped_duplicate,
             "skipped_status_mismatch": skipped_status_mismatch,
             "skipped_too_old": skipped_too_old,
             "seen_status_ids": sorted(list(set(seen_status_ids))),
