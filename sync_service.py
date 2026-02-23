@@ -82,15 +82,27 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
 
 ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("статус")
+ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
+
+# AMO display name to target when admin fills in Заказ № on the sheet.
+# "Заказ отправлен" maps to display name "У курера" in STATUS_DISPLAY_MAP.
+ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
 
 # Maps what the user picks in Google Sheets → the AMO display name used for status ID lookup.
-# Both "У курера" and "Успешно" physically move the lead to "Заказ отправлен" in AMO.
+# Both "У курера" and "Успешно" move the lead to the "Успешно реализовано" (won) step in AMO.
 # "Отказ" moves the lead to the pipeline's reject step.
 SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
     "В процессе": "В процессе",
-    "У курера":   "У курера",
-    "Успешно":    "У курера",
+    "У курера":   "Успешно",
+    "Успешно":    "Успешно",
     "Отказ":      "Отказ",
+}
+
+# Maps an AMO display status name → the status that should be written to the Google Sheet
+# when a tracked lead receives that AMO status via webhook.
+# e.g. when a manager manually sets "Раздумье" in AMO, the sheet row is updated to "Отказ".
+AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
+    "Раздумье": "Отказ",
 }
 
 
@@ -115,6 +127,8 @@ class Config:
     STATUS_ID_TO_NAME = {str(v): k for k, v in STATUS_MAP.items() if v}
 
     SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "60"))
+    # Sheet rotation interval: "monthly" (default) or "hourly" (useful for testing).
+    SHEET_ROTATION_INTERVAL = os.getenv("SHEET_ROTATION_INTERVAL", "monthly").strip().lower()
     # Unix timestamp – webhook leads created BEFORE this are silently ignored. 0 = process all.
     LEADS_CREATED_AFTER = int(os.getenv("LEADS_CREATED_AFTER", "0"))
     # Minimum seconds between consecutive amoCRM API calls. Increase on prod if you see 429s.
@@ -372,6 +386,26 @@ class SheetSync:
         tab = self.cfg.GOOGLE_WORKSHEET_NAME
         return self._get_or_create_sheet(tab)
 
+    def rotate_to_archive(self, archive_tab_name: str) -> None:
+        """Rename the current active worksheet to archive_tab_name, then create a
+        fresh worksheet with the default name so new-month leads start on a clean tab.
+        """
+        with self.lock:
+            main_name = self.cfg.GOOGLE_WORKSHEET_NAME
+            # Rename the existing active sheet to the archive name
+            try:
+                ws = self.spreadsheet.worksheet(main_name)
+                ws.update_title(archive_tab_name)
+                print(f"[INFO] Worksheet '{main_name}' renamed to '{archive_tab_name}'")
+            except gspread.WorksheetNotFound:
+                print(f"[WARN] Worksheet '{main_name}' not found during rotation — skipping rename")
+            # Clear the sheet cache so the renamed tab is no longer served as the active sheet
+            self._sheets.pop(main_name, None)
+            self._sheets.pop(archive_tab_name, None)
+            # Create (or re-open) a new active sheet with headers + dropdown
+            self._get_or_create_sheet(main_name)
+            print(f"[INFO] New active worksheet '{main_name}' created for the new month")
+
     def get_staff_mapping(self) -> Dict[str, str]:
         """Fetch the staff mapping from the 'Staff' sheet (result is cached for STAFF_CACHE_TTL_SEC)."""
         now = time.time()
@@ -476,8 +510,9 @@ class SheetSync:
                 continue
             lead_id = str(row[ID_COL_INDEX]).strip()
             status = str(row[STATUS_COL_INDEX]).strip()
+            order_number = str(row[ORDER_NUM_COL_INDEX]).strip() if len(row) > ORDER_NUM_COL_INDEX else ""
             if lead_id:
-                out.append({"lead_id": lead_id, "status": status})
+                out.append({"lead_id": lead_id, "status": status, "order_number": order_number})
         return out
 
 
@@ -717,10 +752,73 @@ class SyncService:
     def get_known_sheet_status(self, lead_id: str) -> str:
         return self.state.get("sheet_status_by_lead", {}).get(str(lead_id), "")
 
+    def remember_sheet_order_number(self, lead_id: str, order_number: str) -> None:
+        with self.state_lock:
+            self.state.setdefault("sheet_order_number_by_lead", {})[str(lead_id)] = order_number
+        self._save_state()
+
+    def get_known_order_number(self, lead_id: str) -> str:
+        return self.state.get("sheet_order_number_by_lead", {}).get(str(lead_id), "")
+
     def bootstrap_sheet_state(self) -> None:
         rows = self.sheet.iter_lead_statuses()
         for item in rows:
             self.remember_sheet_status(item["lead_id"], item["status"])
+            # Snapshot the current order number so we can detect when it gets filled
+            self.remember_sheet_order_number(item["lead_id"], item.get("order_number", ""))
+
+    def check_and_rotate_sheet(self) -> None:
+        """Archive the active worksheet when the configured interval rolls over.
+
+        SHEET_ROTATION_INTERVAL controls the granularity:
+          - "monthly" (default): rotates on the 1st of each new month.
+                State key: YYYY-MM  →  archive tab name: MM.YYYY  (e.g. 02.2026)
+          - "hourly": rotates every new clock-hour (for testing purposes).
+                State key: YYYY-MM-DD-HH  →  archive tab name: DD.MM.YYYY HH:00
+        """
+        now = datetime.now()
+        interval = self.cfg.SHEET_ROTATION_INTERVAL
+
+        if interval == "hourly":
+            current_key = now.strftime("%Y-%m-%d-%H")          # e.g. "2026-02-24-14"
+            def _archive_name(key: str) -> str:
+                return datetime.strptime(key, "%Y-%m-%d-%H").strftime("%d.%m.%Y %H:00")
+            label = "Hour"
+        else:
+            # Default: monthly
+            current_key = now.strftime("%Y-%m")                 # e.g. "2026-02"
+            def _archive_name(key: str) -> str:
+                return datetime.strptime(key, "%Y-%m").strftime("%m.%Y")
+            label = "Month"
+
+        with self.state_lock:
+            known_key = self.state.get("active_sheet_month", "")
+
+        if not known_key:
+            # First run — record current period, no rotation needed yet
+            with self.state_lock:
+                self.state["active_sheet_month"] = current_key
+            self._save_state()
+            print(f"[INFO] Sheet rotation initialised ({interval}): current period = '{current_key}'")
+            return
+
+        if known_key == current_key:
+            return  # Still within the same period
+
+        # Period has rolled over — archive the old sheet
+        try:
+            archive_name = _archive_name(known_key)
+        except ValueError:
+            archive_name = known_key  # Fallback: use raw key as tab name
+
+        print(f"[INFO] {label} changed '{known_key}' → '{current_key}': archiving sheet as '{archive_name}'")
+        try:
+            self.sheet.rotate_to_archive(archive_name)
+            with self.state_lock:
+                self.state["active_sheet_month"] = current_key
+            self._save_state()
+        except Exception as exc:
+            print(f"[ERROR] Sheet rotation failed: {exc}")
 
     def _enrich_lead_contacts(self, lead: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch full contact details (incl. phone) for each contact embedded in lead."""
@@ -805,6 +903,8 @@ class SyncService:
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
                 self.sheet.upsert_row(row, pipeline_display)
                 self.remember_sheet_status(lead_id, current_status_name)
+                # Lead arrives without Заказ №; record empty so we can detect when admin fills it
+                self.remember_sheet_order_number(lead_id, "")
                 written += 1
                 continue
 
@@ -814,8 +914,15 @@ class SyncService:
                 lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 p_name = self.pipeline_id_to_name.get(lead_pipeline_id, "")
                 p_display = PIPELINE_DISPLAY_MAP.get(p_name, p_name)
-                self.sheet.update_status(lead_id, terminal_name, p_display)
-                self.remember_sheet_status(lead_id, terminal_name)
+                # Apply sheet override: e.g. AMO "Раздумье" → sheet "Отказ"
+                sheet_display = AMO_STATUS_TO_SHEET_OVERRIDE.get(terminal_name, terminal_name)
+                # When admin filled Заказ № → AMO moved to Заказ отправлен → webhook comes back as
+                # "У курера".  Sheet must stay "В процессе" until operator changes it manually.
+                if sheet_display == "У курера" and known_status == "В процессе":
+                    skipped_status_mismatch += 1
+                    continue
+                self.sheet.update_status(lead_id, sheet_display, p_display)
+                self.remember_sheet_status(lead_id, sheet_display)
                 written += 1
             else:
                 if known_status:
@@ -823,8 +930,14 @@ class SyncService:
                     lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                     p_name = self.pipeline_id_to_name.get(lead_pipeline_id, "")
                     p_display = PIPELINE_DISPLAY_MAP.get(p_name, p_name)
-                    self.sheet.update_status(lead_id, new_status_display, p_display)
-                    self.remember_sheet_status(lead_id, new_status_display)
+                    # Apply sheet override: e.g. AMO "Раздумье" → sheet "Отказ"
+                    sheet_display = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
+                    # Same suppression: Заказ отправлен webhook must not overwrite "В процессе"
+                    if sheet_display == "У курера" and known_status == "В процессе":
+                        skipped_status_mismatch += 1
+                        continue
+                    self.sheet.update_status(lead_id, sheet_display, p_display)
+                    self.remember_sheet_status(lead_id, sheet_display)
                     written += 1
                 else:
                     skipped_status_mismatch += 1
@@ -848,6 +961,40 @@ class SyncService:
         for item in rows:
             lead_id = item["lead_id"]
             status_name = item["status"]
+            order_number = item.get("order_number", "")
+
+            # ── Order-number trigger: Заказ № filled by admin → move to Заказ отправлен ──
+            known_order = self.get_known_order_number(lead_id)
+            # Only act if:
+            #  • we have previously tracked this lead (known_order is not None sentinel),
+            #  • the order number was empty before, and
+            #  • it is now non-empty.
+            # Use a sentinel of None (key absent) to mean "never tracked" vs. "" (empty).
+            order_was_tracked = str(lead_id) in self.state.get("sheet_order_number_by_lead", {})
+            if order_was_tracked and not known_order and order_number:
+                try:
+                    lead = self.amo.get(f"/api/v4/leads/{lead_id}")
+                    lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
+                    status_id = self.pipeline_status_display_to_id.get(lead_pipeline_id, {}).get(ORDER_NUM_FILLED_AMO_STATUS_DISPLAY)
+                    if not status_id:
+                        status_id = self.pipeline_status_name_to_id.get(lead_pipeline_id, {}).get("Заказ отправлен")
+                    if status_id:
+                        self.amo.patch(
+                            f"/api/v4/leads/{lead_id}",
+                            {
+                                "status_id": status_id,
+                                "pipeline_id": lead_pipeline_id or self.cfg.PIPELINE_ID,
+                            },
+                        )
+                        print(f"[INFO] Lead {lead_id}: Заказ № filled ('{order_number}') → moved to Заказ отправлен in AMO")
+                    else:
+                        print(f"[WARN] Lead {lead_id}: Заказ № filled but could not find 'Заказ отправлен' status ID for pipeline {lead_pipeline_id}")
+                    # Remember new order number regardless (avoids re-triggering)
+                    self.remember_sheet_order_number(lead_id, order_number)
+                except Exception as exc:
+                    print(f"Failed to move lead {lead_id} to Заказ отправлен: {exc}")
+
+            # ── Status trigger: sheet status changed → push to AMO ──
             if status_name not in self.cfg.STATUS_MAP:
                 continue
 
@@ -890,6 +1037,9 @@ app = FastAPI(title="amoCRM <-> Google Sheets Sync")
 
 @app.on_event("startup")
 def on_startup() -> None:
+    # Check for month rollover before bootstrapping state
+    service.check_and_rotate_sheet()
+
     # Retry bootstrap on Sheets quota errors (429)
     for attempt in range(1, 6):
         try:
@@ -908,6 +1058,7 @@ def on_startup() -> None:
         backoff = 0
         while True:
             try:
+                service.check_and_rotate_sheet()
                 service.sync_sheet_to_amo()
                 backoff = 0
             except Exception as exc:
