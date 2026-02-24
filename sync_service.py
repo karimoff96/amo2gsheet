@@ -18,45 +18,42 @@ load_dotenv()
 
 
 COLUMNS = [
+    "Компания",
     "ID",
+    "Заказ №",
     "Ф.И.О.",
     "Контактный номер",
-    "Бюджет сделки",
-    "Заказ №",
+    "Дата заказа",
+    "Дата доставка",
+    "Код сотрудника",
+    "Ответственный",
+    "Группа",
     "Продукт 1",
     "Количество 1",
     "Продукт 2",
     "Количество 2",
-    "Группа",
-    "Дата заказа",
-    "Дата доставка",
+    "Бюджет сделки",
     "Регион",
     "Адрес",
     "Тип продажи",
     "Продажа в рассрочку",
-    "Код сотрудника",
-    "Компания",
     "Воронка",
-    "статус",
-    "Ответственный",
+    "Статус",
 ]
 
-# Maps raw AmoCRM pipeline name → proper Russian display name written to Google Sheets
-PIPELINE_DISPLAY_MAP: Dict[str, str] = {
-    "Nilufar - Sotuv Bioflex":   "Нилуфар",
-    "NILUFAR - SOTUV BIOFLEX":   "Нилуфар",
-    "Munira - Sotuv Bioflex":    "Мунира",
-    "MUNIRA - SOTUV BIOFLEX":    "Мунира",
-    "Rushana  - Sotuv Bioflex":  "Рушана",
-    "Rushana - Sotuv Bioflex":   "Рушана",
-    "RUSHANA - SOTUV BIOFLEX":   "Рушана",
-    "Baza Uspeshno":             "База (Успешно)",
-    "BAZA USPESHNO":             "База (Успешно)",
-    "Baza Dumka":                "База (Раздумье)",
-    "BAZA DUMKA":                "База (Раздумье)",
-    "Akobir - Sotuv Bioflex":    "Акобир",
-    "AKOBIR - SOTUV BIOFLEX":    "Акобир",
-}
+# Maps raw AmoCRM pipeline name → display name written to Google Sheets.
+# Populated dynamically from AMO at startup; every pipeline found in the AMO
+# account is registered automatically using its raw name as the display value.
+# Use PIPELINE_DISPLAY_MAP_JSON in .env to set shorter / prettier names.
+PIPELINE_DISPLAY_MAP: Dict[str, str] = {}
+
+# Allow .env to add/override pipeline display names without editing this file.
+# Example: PIPELINE_DISPLAY_MAP_JSON={"Nilufar - Sotuv Bioflex": "Нилуфар", ...}
+try:
+    _env_pipeline_map: Dict[str, str] = json.loads(os.getenv("PIPELINE_DISPLAY_MAP_JSON", "{}"))
+    PIPELINE_DISPLAY_MAP.update(_env_pipeline_map)
+except Exception:
+    pass
 
 # Maps raw AmoCRM status name → proper Russian display name written to Google Sheets
 STATUS_DISPLAY_MAP: Dict[str, str] = {
@@ -81,7 +78,7 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
 }
 
 ID_COL_INDEX = COLUMNS.index("ID")
-STATUS_COL_INDEX = COLUMNS.index("статус")
+STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
 
 # AMO display name to target when admin fills in Заказ № on the sheet.
@@ -122,6 +119,10 @@ class Config:
     TRIGGER_STATUS_ID = int(os.getenv("TRIGGER_STATUS_ID", "0"))
     PIPELINE_ID = int(os.getenv("PIPELINE_ID", "0"))
     TRIGGER_STATUS_NAME = os.getenv("TRIGGER_STATUS_NAME", "NOMERATSIYALANMAGAN ZAKAZ").strip()
+    # Additional trigger status names for multi-pipeline setups (comma-separated).
+    # When different pipelines (Воронка) use a differently-named status to signal a new
+    # order, list those names here.  All names are checked during status resolution.
+    TRIGGER_STATUS_NAMES_EXTRA = os.getenv("TRIGGER_STATUS_NAMES", "").strip()
 
     STATUS_MAP = json.loads(os.getenv("DROPDOWN_STATUS_MAP_JSON", "{}"))
     STATUS_ID_TO_NAME = {str(v): k for k, v in STATUS_MAP.items() if v}
@@ -129,6 +130,9 @@ class Config:
     SYNC_POLL_SECONDS = int(os.getenv("SYNC_POLL_SECONDS", "60"))
     # Sheet rotation interval: "monthly" (default) or "hourly" (useful for testing).
     SHEET_ROTATION_INTERVAL = os.getenv("SHEET_ROTATION_INTERVAL", "monthly").strip().lower()
+    # Initial date-range sync: YYYY-MM-DD strings. Both must be set to activate.
+    INITIAL_SYNC_DATE_FROM = os.getenv("INITIAL_SYNC_DATE_FROM", "").strip()
+    INITIAL_SYNC_DATE_TO   = os.getenv("INITIAL_SYNC_DATE_TO",   "").strip()
     # Unix timestamp – webhook leads created BEFORE this are silently ignored. 0 = process all.
     LEADS_CREATED_AFTER = int(os.getenv("LEADS_CREATED_AFTER", "0"))
     # Minimum seconds between consecutive amoCRM API calls. Increase on prod if you see 429s.
@@ -334,6 +338,46 @@ class AmoClient:
             raise RuntimeError(f"GET {endpoint} failed: {r.status_code} {r.text}")
         return r.json()
 
+    def fetch_leads_by_date_range(
+        self, date_from: str, date_to: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch all AMO leads whose created_at falls in [date_from, date_to] (YYYY-MM-DD).
+
+        Pages through the full result set automatically.
+        """
+        try:
+            ts_from = int(datetime.strptime(date_from, "%Y-%m-%d").timestamp())
+            # Include the entire last day (up to 23:59:59).
+            ts_to   = int(datetime.strptime(date_to,   "%Y-%m-%d").timestamp()) + 86399
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid date format (expected YYYY-MM-DD): {exc}")
+
+        all_leads: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            endpoint = (
+                f"/api/v4/leads"
+                f"?filter[created_at][from]={ts_from}"
+                f"&filter[created_at][to]={ts_to}"
+                f"&with=contacts,companies"
+                f"&limit=250&page={page}"
+            )
+            try:
+                data = self.get(endpoint)
+            except RuntimeError as exc:
+                if "204" in str(exc) or "No Content" in str(exc):
+                    break  # AMO returns 204 when there are no more pages
+                raise
+            leads = (data.get("_embedded") or {}).get("leads") or []
+            if not leads:
+                break
+            all_leads.extend(leads)
+            # AMO paginates with _links.next; stop when it is absent.
+            if not (data.get("_links") or {}).get("next"):
+                break
+            page += 1
+        return all_leads
+
     def patch(self, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
         token = self.get_access_token()
         r = self._api_request(
@@ -358,6 +402,11 @@ class SheetSync:
         # Staff mapping cache – refreshed every STAFF_CACHE_TTL_SEC seconds
         self._staff_cache: Dict[str, str] = {}
         self._staff_cache_ts: float = 0.0
+        # In-memory row index: ws_name → {lead_id → 1-based row number}
+        # A single get_all_values() builds the index; all subsequent find_row / upsert
+        # calls are O(1) dict lookups with no additional Sheets API calls.
+        self._row_index: Dict[str, Dict[str, int]] = {}
+        self._row_count: Dict[str, int] = {}  # ws_name → last occupied row number
 
     def _get_or_create_sheet(self, name: str):
         if name in self._sheets:
@@ -373,6 +422,8 @@ class SheetSync:
             if first_row != COLUMNS:
                 ws.update(values=[COLUMNS], range_name="A1")
                 ws.freeze(rows=1)
+                # Header changed — row index is stale
+                self._invalidate_row_index(name)
             # Apply dropdown validation to the entire status column (rows 2-2000)
             status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
             self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
@@ -402,6 +453,9 @@ class SheetSync:
             # Clear the sheet cache so the renamed tab is no longer served as the active sheet
             self._sheets.pop(main_name, None)
             self._sheets.pop(archive_tab_name, None)
+            # Invalidate row indices for both old and new tab names
+            self._invalidate_row_index(main_name)
+            self._invalidate_row_index(archive_tab_name)
             # Create (or re-open) a new active sheet with headers + dropdown
             self._get_or_create_sheet(main_name)
             print(f"[INFO] New active worksheet '{main_name}' created for the new month")
@@ -433,7 +487,7 @@ class SheetSync:
             print(f"[WARN] Could not load Staff sheet: {e}")
             return self._staff_cache  # Return stale cache on error rather than empty
 
-    # Statuses that can be chosen from the dropdown in the "статус" column
+    # Statuses that can be chosen from the dropdown in the "Статус" column
     STATUS_DROPDOWN_OPTIONS = ["В процессе", "У курера", "Успешно", "Отказ"]
 
     def _apply_status_dropdown(self, ws, row_range: str) -> None:
@@ -458,31 +512,55 @@ class SheetSync:
             return []
         return values[1:]
 
+    # ── Row index cache ───────────────────────────────────────────────────────
+    # Eliminates repeated get_all_values() calls.  Built once per worksheet on
+    # first access; updated in O(1) whenever a row is appended or header reset.
+
+    def _build_row_index(self, ws, ws_name: str) -> None:
+        """Read the sheet once and build lead_id → row_number mapping."""
+        all_vals = ws.get_all_values()
+        idx: Dict[str, int] = {}
+        for i, row in enumerate(all_vals):
+            if i == 0:
+                continue  # skip header
+            if len(row) > ID_COL_INDEX:
+                lid = str(row[ID_COL_INDEX]).strip()
+                if lid:
+                    idx[lid] = i + 1  # 1-based row number
+        self._row_index[ws_name] = idx
+        self._row_count[ws_name] = len(all_vals)
+
+    def _get_row_index(self, ws, ws_name: str) -> Dict[str, int]:
+        if ws_name not in self._row_index:
+            self._build_row_index(ws, ws_name)
+        return self._row_index[ws_name]
+
+    def _invalidate_row_index(self, ws_name: str) -> None:
+        """Discard cached index so it is rebuilt on next access."""
+        self._row_index.pop(ws_name, None)
+        self._row_count.pop(ws_name, None)
+
     def find_row(self, ws, lead_id: str) -> Optional[int]:
-        rows = self._all_rows(ws)
-        for idx, row in enumerate(rows, start=2):
-            if len(row) > ID_COL_INDEX and str(row[ID_COL_INDEX]).strip() == str(lead_id):
-                return idx
-        return None
+        """O(1) row lookup via in-memory index (cold start: one get_all_values())."""
+        return self._get_row_index(ws, ws.title).get(str(lead_id))
 
     def upsert_row(self, row_data: List[Any], pipeline_display: str = "") -> int:
         ws = self._sheet_for_pipeline(pipeline_display)
         lead_id = str(row_data[ID_COL_INDEX])
+        ws_name = ws.title
         with self.lock:
-            row_num = self.find_row(ws, lead_id)
+            row_idx = self._get_row_index(ws, ws_name)
+            row_num = row_idx.get(lead_id)
             if row_num:
                 ws.update(values=[row_data], range_name=f"A{row_num}")
                 return row_num
-            
-            all_vals = ws.get_all_values()
-            next_row = len(all_vals) + 1
-            # Find the first completely empty row to avoid skipping rows if user cleared contents
-            for i, row in enumerate(all_vals):
-                if i > 0 and not any(str(cell).strip() for cell in row):
-                    next_row = i + 1
-                    break
-                    
+
+            # Append after the last known row — no second get_all_values() needed
+            next_row = self._row_count.get(ws_name, 1) + 1
             ws.update(values=[row_data], range_name=f"A{next_row}")
+            # Keep index consistent
+            row_idx[lead_id] = next_row
+            self._row_count[ws_name] = next_row
             # Apply a dropdown to the status cell of the new row
             status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
             self._apply_status_dropdown(ws, f"{status_col_letter}{next_row}:{status_col_letter}{next_row}")
@@ -575,7 +653,7 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
     mapped: Dict[str, Any] = {
         "ID": lead.get("id", ""),
         "Бюджет сделки": lead.get("price", ""),
-        "статус": display_status,
+        "Статус": display_status,
         "Воронка": display_pipeline,
         "Ф.И.О.": contact_name,
         "Контактный номер": contact_phone,
@@ -620,6 +698,11 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
                     if clean_val in staff_mapping:
                         mapped["Ответственный"] = staff_mapping[clean_val]
 
+    # Re-apply pipeline-derived fields AFTER custom fields so AMO custom fields
+    # named "Статус" or "Воронка" can never silently overwrite the correct values.
+    mapped["Статус"] = display_status
+    mapped["Воронка"] = display_pipeline
+
     return [mapped.get(col, "") for col in COLUMNS]
 
 
@@ -633,6 +716,7 @@ class SyncService:
         self.state_lock = threading.Lock()
         self.state_path = Path(".sync_state.json")
         self.state = self._load_state()
+        self._state_dirty: bool = False  # True when in-memory state differs from disk
         self.trigger_status_ids: set[int] = set()
         self.terminal_status_id_to_name: Dict[str, str] = {}
         self.pipeline_status_name_to_id: Dict[int, Dict[str, int]] = {}
@@ -689,6 +773,15 @@ class SyncService:
             pipeline_id = int(pipeline.get("id", 0) or 0)
             pipeline_raw_name = str(pipeline.get("name", "")).strip()
             self.pipeline_id_to_name[pipeline_id] = pipeline_raw_name
+
+            # Auto-register any pipeline not yet in the display map using its raw
+            # AMO name as the display value.  .env PIPELINE_DISPLAY_MAP_JSON entries
+            # (loaded at module level) take precedence because they were applied first.
+            if pipeline_raw_name and pipeline_raw_name not in PIPELINE_DISPLAY_MAP:
+                PIPELINE_DISPLAY_MAP[pipeline_raw_name] = pipeline_raw_name
+                print(f"[INFO] Pipeline auto-registered: '{pipeline_raw_name}' "
+                      f"(set PIPELINE_DISPLAY_MAP_JSON to customise display name)")
+
             statuses = pipeline.get("_embedded", {}).get("statuses", [])
             if pipeline_id not in self.pipeline_status_name_to_id:
                 self.pipeline_status_name_to_id[pipeline_id] = {}
@@ -706,12 +799,19 @@ class SyncService:
                 self.pipeline_status_display_to_id[pipeline_id][display_name] = status_id
                 self.status_id_to_display_name[status_id] = display_name
 
-                # Match trigger by raw name OR display name (handles already-translated pipelines)
-                trigger_display = STATUS_DISPLAY_MAP.get(
-                    self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME
-                )
-                if status_name == self.cfg.TRIGGER_STATUS_NAME or display_name == trigger_display:
-                    self.trigger_status_ids.add(status_id)
+                # Build the full list of trigger names to check (primary + extras).
+                all_trigger_names = [self.cfg.TRIGGER_STATUS_NAME]
+                for _tn in self.cfg.TRIGGER_STATUS_NAMES_EXTRA.split(","):
+                    _tn = _tn.strip()
+                    if _tn and _tn not in all_trigger_names:
+                        all_trigger_names.append(_tn)
+
+                # Match trigger by raw name OR display name across ALL configured trigger names.
+                for t_name in all_trigger_names:
+                    t_display = STATUS_DISPLAY_MAP.get(t_name, t_name)
+                    if status_name == t_name or display_name == t_display:
+                        self.trigger_status_ids.add(status_id)
+                        break
 
                 if display_name in self.cfg.STATUS_MAP or status_name in self.cfg.STATUS_MAP:
                     self.terminal_status_id_to_name[str(status_id)] = display_name
@@ -738,16 +838,23 @@ class SyncService:
         return {"sheet_status_by_lead": {}}
 
     def _save_state(self) -> None:
+        """Unconditionally write state to disk. Prefer flush_state() for batching."""
         with self.state_lock:
             self.state_path.write_text(
                 json.dumps(self.state, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._state_dirty = False
+
+    def flush_state(self) -> None:
+        """Write state to disk only if it changed since the last save (batching)."""
+        if self._state_dirty:
+            self._save_state()
 
     def remember_sheet_status(self, lead_id: str, status_name: str) -> None:
         with self.state_lock:
             self.state.setdefault("sheet_status_by_lead", {})[str(lead_id)] = status_name
-        self._save_state()
+            self._state_dirty = True
 
     def get_known_sheet_status(self, lead_id: str) -> str:
         return self.state.get("sheet_status_by_lead", {}).get(str(lead_id), "")
@@ -755,10 +862,58 @@ class SyncService:
     def remember_sheet_order_number(self, lead_id: str, order_number: str) -> None:
         with self.state_lock:
             self.state.setdefault("sheet_order_number_by_lead", {})[str(lead_id)] = order_number
-        self._save_state()
+            self._state_dirty = True
 
     def get_known_order_number(self, lead_id: str) -> str:
         return self.state.get("sheet_order_number_by_lead", {}).get(str(lead_id), "")
+
+    # ── Lead lifetime / expiry ────────────────────────────────────────────────
+    # When a lead reaches a terminal status we start a countdown. Once the
+    # countdown expires every subsequent webhook for that lead is ignored and
+    # the lead is removed from the state entirely.
+    _EXPIRY_SECONDS: Dict[str, int] = {
+        "Успешно": 12 * 3600,   # 12 hours
+        "Отказ":   24 * 3600,   # 24 hours
+    }
+
+    def remember_lead_expiry(self, lead_id: str, expiry_ts: float) -> None:
+        """Record the Unix timestamp at which we should stop tracking this lead."""
+        with self.state_lock:
+            self.state.setdefault("lead_expiry", {})[str(lead_id)] = expiry_ts
+            self._state_dirty = True
+
+    def is_lead_expired(self, lead_id: str) -> bool:
+        """Return True if the lead's monitoring window has already passed."""
+        expiry = self.state.get("lead_expiry", {}).get(str(lead_id))
+        return expiry is not None and time.time() >= expiry
+
+    def forget_lead(self, lead_id: str) -> None:
+        """Remove all tracking data for a lead (called when its lifetime ends)."""
+        lid = str(lead_id)
+        with self.state_lock:
+            self.state.get("sheet_status_by_lead",       {}).pop(lid, None)
+            self.state.get("sheet_order_number_by_lead", {}).pop(lid, None)
+            self.state.get("lead_expiry",                {}).pop(lid, None)
+            self._state_dirty = True
+
+    def expire_finished_leads(self) -> None:
+        """Purge leads whose monitoring window has elapsed. Called from the worker loop."""
+        now = time.time()
+        expired = [
+            lid for lid, ts in list(self.state.get("lead_expiry", {}).items())
+            if now >= ts
+        ]
+        for lid in expired:
+            print(f"[INFO] Lead {lid} monitoring lifetime ended — removing from tracking.")
+            self.forget_lead(lid)
+        if expired:
+            self.flush_state()
+
+    def _set_expiry_for_status(self, lead_id: str, status_display: str) -> None:
+        """If status_display has a configured lifetime, start (or overwrite) the countdown."""
+        seconds = self._EXPIRY_SECONDS.get(status_display)
+        if seconds is not None:
+            self.remember_lead_expiry(lead_id, time.time() + seconds)
 
     def bootstrap_sheet_state(self) -> None:
         rows = self.sheet.iter_lead_statuses()
@@ -766,6 +921,60 @@ class SyncService:
             self.remember_sheet_status(item["lead_id"], item["status"])
             # Snapshot the current order number so we can detect when it gets filled
             self.remember_sheet_order_number(item["lead_id"], item.get("order_number", ""))
+        self.flush_state()  # Persist bootstrapped state in one write
+
+    def initial_sync_leads(self, date_from: str, date_to: str) -> None:
+        """Fetch all AMO leads created in [date_from, date_to] and upsert them into the sheet.
+
+        Called once on startup when INITIAL_SYNC_DATE_FROM / INITIAL_SYNC_DATE_TO are set.
+        Leads already present in the sheet are updated in-place; new ones are appended.
+        """
+        print(f"[INFO] Initial sync: fetching AMO leads created {date_from} – {date_to} …")
+        try:
+            leads = self.amo.fetch_leads_by_date_range(date_from, date_to)
+        except Exception as exc:
+            print(f"[ERROR] Initial sync failed to fetch leads: {exc}")
+            return
+
+        print(f"[INFO] Initial sync: {len(leads)} lead(s) returned from AMO.")
+        staff_mapping = self.sheet.get_staff_mapping()
+        written = 0
+        skipped = 0
+
+        for lead in leads:
+            lead_id = str(lead.get("id", "")).strip()
+            if not lead_id:
+                skipped += 1
+                continue
+
+            # Enrich with full contact details (phone numbers).
+            try:
+                lead = self._enrich_lead_contacts(lead)
+            except Exception:
+                pass
+
+            status_id     = int(lead.get("status_id", 0) or 0)
+            pipeline_id   = int(lead.get("pipeline_id", 0) or 0)
+            pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
+            pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
+
+            # Resolve status display name via the same map used by webhooks.
+            status_display = self.status_id_to_display_name.get(
+                status_id,
+                STATUS_DISPLAY_MAP.get(str(status_id), str(status_id)),
+            )
+
+            responsible_id   = int(lead.get("responsible_user_id", 0) or 0)
+            responsible_name = self.users_map.get(responsible_id, str(responsible_id))
+
+            row = build_row(lead, status_display, pipeline_name, responsible_name, staff_mapping)
+            self.sheet.upsert_row(row, pipeline_display)
+            self.remember_sheet_status(lead_id, status_display)
+            self.remember_sheet_order_number(lead_id, "")
+            written += 1
+
+        self.flush_state()  # Persist all initial sync state in one write
+        print(f"[INFO] Initial sync complete: {written} written, {skipped} skipped.")
 
     def check_and_rotate_sheet(self) -> None:
         """Archive the active worksheet when the configured interval rolls over.
@@ -864,6 +1073,11 @@ class SyncService:
                 skipped_duplicate += 1
                 continue
 
+            # Skip leads whose monitoring lifetime has ended
+            if self.is_lead_expired(lead_id):
+                skipped_status_mismatch += 1
+                continue
+
             is_trigger = webhook_status_id in self.trigger_status_ids
             is_terminal = str(webhook_status_id) in self.terminal_status_id_to_name
             known_status = self.get_known_sheet_status(lead_id)
@@ -923,6 +1137,7 @@ class SyncService:
                     continue
                 self.sheet.update_status(lead_id, sheet_display, p_display)
                 self.remember_sheet_status(lead_id, sheet_display)
+                self._set_expiry_for_status(lead_id, sheet_display)
                 written += 1
             else:
                 if known_status:
@@ -938,10 +1153,13 @@ class SyncService:
                         continue
                     self.sheet.update_status(lead_id, sheet_display, p_display)
                     self.remember_sheet_status(lead_id, sheet_display)
+                    self._set_expiry_for_status(lead_id, sheet_display)
                     written += 1
                 else:
                     skipped_status_mismatch += 1
 
+        # Flush all state mutations accumulated during this batch in one disk write
+        self.flush_state()
         return {
             "received": len(leads),
             "written": written,
@@ -1029,6 +1247,8 @@ class SyncService:
                 self.remember_sheet_status(lead_id, status_name)
             except Exception as exc:
                 print(f"Failed to sync sheet->amo for lead {lead_id}: {exc}")
+        # One disk write for all status updates in this poll cycle
+        self.flush_state()
 
 
 service = SyncService()
@@ -1039,6 +1259,17 @@ app = FastAPI(title="amoCRM <-> Google Sheets Sync")
 def on_startup() -> None:
     # Check for month rollover before bootstrapping state
     service.check_and_rotate_sheet()
+
+    # Run initial date-range sync before bootstrapping sheet state so that
+    # leads pulled from AMO are immediately reflected in the local state.
+    if service.cfg.INITIAL_SYNC_DATE_FROM and service.cfg.INITIAL_SYNC_DATE_TO:
+        try:
+            service.initial_sync_leads(
+                service.cfg.INITIAL_SYNC_DATE_FROM,
+                service.cfg.INITIAL_SYNC_DATE_TO,
+            )
+        except Exception as exc:
+            print(f"[ERROR] Initial date-range sync failed: {exc}")
 
     # Retry bootstrap on Sheets quota errors (429)
     for attempt in range(1, 6):
@@ -1059,6 +1290,7 @@ def on_startup() -> None:
         while True:
             try:
                 service.check_and_rotate_sheet()
+                service.expire_finished_leads()
                 service.sync_sheet_to_amo()
                 backoff = 0
             except Exception as exc:
