@@ -13,6 +13,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from gspread.utils import ValidationConditionType
+from dashboard_router import create_dashboard_router
 
 load_dotenv()
 
@@ -334,6 +335,8 @@ class AmoClient:
     def get(self, endpoint: str) -> Dict[str, Any]:
         token = self.get_access_token()
         r = self._api_request("GET", f"{self.base_url}{endpoint}", self._headers(token))
+        if r.status_code == 204 or not r.text:
+            return {}
         if r.status_code >= 400:
             raise RuntimeError(f"GET {endpoint} failed: {r.status_code} {r.text}")
         return r.json()
@@ -1253,6 +1256,9 @@ class SyncService:
 
 service = SyncService()
 app = FastAPI(title="amoCRM <-> Google Sheets Sync")
+
+# Mount staff KPI dashboard (completely independent from sync logic)
+app.include_router(create_dashboard_router(service))
 
 
 @app.on_event("startup")
