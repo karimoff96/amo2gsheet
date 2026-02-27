@@ -10,12 +10,12 @@ from urllib.parse import parse_qs, urlparse
 
 import gspread
 import requests
-from dotenv import load_dotenv
+from env_loader import load_env
 from fastapi import FastAPI, Request
 from gspread.utils import ValidationConditionType
 from dashboard_router import create_dashboard_router
 
-load_dotenv()
+load_env()
 
 
 COLUMNS = [

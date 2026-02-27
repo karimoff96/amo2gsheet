@@ -18,9 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
+from env_loader import load_env
 
-load_dotenv()
+load_env()
 
 # ── Config from .env ──────────────────────────────────────────────────────────
 SUBDOMAIN  = os.getenv("AMO_SUBDOMAIN", "").strip()

@@ -37,10 +37,10 @@ from typing import Any, Dict, List, Optional
 
 import gspread
 import requests
-from dotenv import load_dotenv
+from env_loader import load_env
 from gspread.utils import ValidationConditionType
 
-load_dotenv()
+load_env()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Column / status definitions  (must mirror sync_service.py)

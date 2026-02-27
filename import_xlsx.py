@@ -35,9 +35,9 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
-from dotenv import load_dotenv
+from env_loader import load_env
 
-load_dotenv()
+load_env()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Column definitions (must match sync_service.py COLUMNS)

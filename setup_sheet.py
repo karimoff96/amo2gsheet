@@ -20,10 +20,10 @@ import sys
 from pathlib import Path
 
 import gspread
-from dotenv import load_dotenv
+from env_loader import load_env
 from gspread.utils import ValidationConditionType
 
-load_dotenv()
+load_env()
 
 # ── Config from .env ──────────────────────────────────────────────────────────
 SA_FILE    = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "gsheet.json").strip()
