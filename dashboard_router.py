@@ -733,10 +733,25 @@ _LOGIN_HTML = """<!DOCTYPE html>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     body { background:#0b1120; font-family:'Inter',system-ui,sans-serif; }
-    input { background:#151f32; border:1px solid #1e2d45; color:#e2e8f0;
+    input { background:#ffffff !important; border:1px solid #2d3f5a; color:#0f172a !important;
+            -webkit-text-fill-color:#0f172a !important;
+            color-scheme: light !important;
             border-radius:8px; padding:10px 14px; width:100%; font-size:14px;
-            outline:none; transition:border-color .15s; box-sizing:border-box; }
-    input:focus { border-color:#3b82f6; }
+            outline:none; box-sizing:border-box; }
+    input::placeholder { color:#94a3b8 !important; opacity:1; }
+    input:focus, input:active, input:hover {
+      background:#ffffff !important;
+      color:#0f172a !important;
+      -webkit-text-fill-color:#0f172a !important;
+      color-scheme: light !important;
+      border-color:#3b82f6 !important; }
+    input:-webkit-autofill,
+    input:-webkit-autofill:focus,
+    input:-webkit-autofill:hover,
+    input:-webkit-autofill:active {
+      -webkit-box-shadow: 0 0 0 1000px #ffffff inset !important;
+      -webkit-text-fill-color: #0f172a !important;
+      color-scheme: light !important; }
     .btn-login { background:#2563eb; color:#fff; border-radius:8px; padding:11px;
                  width:100%; font-size:14px; font-weight:600; cursor:pointer;
                  border:none; transition:background .15s; }
@@ -763,12 +778,14 @@ _LOGIN_HTML = """<!DOCTYPE html>
           <label style="color:#64748b;font-size:11px;text-transform:uppercase;
                         letter-spacing:.06em;display:block;margin-bottom:6px">Логин</label>
           <input type="text" name="username" autocomplete="username"
+                 style="background:#ffffff !important;color:#0f172a !important;color-scheme:light"
                  placeholder="Введите логин" required />
         </div>
         <div style="margin-bottom:22px">
           <label style="color:#64748b;font-size:11px;text-transform:uppercase;
                         letter-spacing:.06em;display:block;margin-bottom:6px">Пароль</label>
           <input type="password" name="password" autocomplete="current-password"
+                 style="background:#ffffff !important;color:#0f172a !important;color-scheme:light"
                  placeholder="Введите пароль" required />
         </div>
         <button type="submit" class="btn-login">Войти</button>
@@ -778,6 +795,24 @@ _LOGIN_HTML = """<!DOCTYPE html>
       amoCRM → Google Sheets &nbsp;·&nbsp; KPI Dashboard
     </p>
   </div>
+  <script>
+    // Force visible text on all inputs — overrides any browser/autofill override
+    function fixInputs() {
+      document.querySelectorAll('input').forEach(function(el) {
+        el.style.setProperty('color', '#0f172a', 'important');
+        el.style.setProperty('background-color', '#ffffff', 'important');
+        el.style.setProperty('opacity', '1', 'important');
+      });
+    }
+    fixInputs();
+    // Re-apply after autofill kicks in (Chrome fires it ~100ms after load)
+    setTimeout(fixInputs, 200);
+    setTimeout(fixInputs, 600);
+    document.querySelectorAll('input').forEach(function(el) {
+      el.addEventListener('animationstart', fixInputs);
+      el.addEventListener('change', fixInputs);
+    });
+  </script>
 </body>
 </html>"""
 
