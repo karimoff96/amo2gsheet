@@ -6,7 +6,7 @@
 # ============================================================
 set -euo pipefail
 
-PROJECT_DIR="/root/amo2gsheet"
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$PROJECT_DIR/venv"
 SERVICE_NAME="amo2gsheet"
 LOG_DIR="/var/log/amo2gsheet"
@@ -70,7 +70,9 @@ mkdir -p "$LOG_DIR"
 echo "    Log dir: $LOG_DIR"
 
 echo "==> [6/7] Installing systemd services..."
-cp deploy/amo2gsheet.service /etc/systemd/system/amo2gsheet.service
+# Substitute the actual project path into the service file before installing
+sed "s|/root/amo2gsheet|$PROJECT_DIR|g" deploy/amo2gsheet.service \
+    > /etc/systemd/system/amo2gsheet.service
 
 # Only install cloudflared service if token is configured in it
 if grep -q "YOUR_TUNNEL_TOKEN_HERE" deploy/cloudflared.service; then
