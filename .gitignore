@@ -21,3 +21,7 @@ data.xlsx
 *.csv
 .prod_gsheet.xlsx
 .dev_gsheet.xlsx
+# Debug / one-off scripts and their output
+_debug_*.py
+_debug_*.txt
+_debug_*.json

@@ -12,13 +12,16 @@ Routes:
 from __future__ import annotations
 
 import io
+import json
+import os
+import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import APIRouter, Form, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 # ── Staff sheet cache (avoid re-fetching on every dashboard refresh) ─────────
 _staff_cache: Dict = {"data": None, "ts": 0.0}
@@ -29,6 +32,46 @@ _STAFF_CACHE_TTL = 300  # seconds
 # TTL: 60 s when today is in the range (data is live), 300 s for past-only ranges.
 _stats_cache: Dict = {}  # (date_from, date_to) → {"ts": float, "data": dict}
 _leads_cache: Dict = {}  # (date_from, date_to) → {"ts": float, "leads": list}
+
+# ── Session store ─────────────────────────────────────────────────
+# token → {"username": str, "created_at": float}
+_sessions: Dict[str, Dict] = {}
+_SESSION_TTL = int(os.getenv("DASHBOARD_SESSION_TTL", str(8 * 3600)))  # default 8 h
+
+
+def _load_admins() -> List[Dict[str, str]]:
+    """Load admin credentials from env.
+
+    Priority:
+    1. DASHBOARD_ADMINS_JSON  = '[{"username":"alice","password":"s3cr3t"}, ...]'
+    2. DASHBOARD_ADMIN_USERNAME + DASHBOARD_ADMIN_PASSWORD  (single admin fallback)
+    """
+    raw = os.getenv("DASHBOARD_ADMINS_JSON", "").strip()
+    if raw:
+        try:
+            admins = json.loads(raw)
+            if isinstance(admins, list) and admins:
+                return admins
+        except Exception:
+            pass
+    u = os.getenv("DASHBOARD_ADMIN_USERNAME", "admin").strip()
+    p = os.getenv("DASHBOARD_ADMIN_PASSWORD", "").strip()
+    if p:
+        return [{"username": u, "password": p}]
+    return []  # no credentials configured — login will always fail
+
+
+def _check_session(token: str) -> str | None:
+    """Return username if token is valid and not expired, else None."""
+    if not token:
+        return None
+    entry = _sessions.get(token)
+    if not entry:
+        return None
+    if time.time() - entry["created_at"] > _SESSION_TTL:
+        _sessions.pop(token, None)
+        return None
+    return entry["username"]
 
 # ── Status display names that count as a confirmed order for KPI ─────────────
 # Includes every stage at or beyond "Заказ" — the order has been placed.
@@ -53,10 +96,63 @@ def _norm(name: str) -> str:
 def create_dashboard_router(service) -> APIRouter:
     router = APIRouter()
 
+    # ── Auth helpers ──────────────────────────────────────────────────────────
+    def _user(request: Request) -> str | None:
+        return _check_session(request.cookies.get("dash_token", ""))
+
+    def _login_response(error: str = "") -> HTMLResponse:
+        err_block = (
+            f'<div class="err" style="margin-bottom:16px">{error}</div>'
+            if error else ""
+        )
+        return HTMLResponse(_LOGIN_HTML.replace("{error_block}", err_block))
+
+    # ── Login / Logout ────────────────────────────────────────────────────────
+    @router.get("/login", response_class=HTMLResponse, tags=["auth"])
+    def login_page(request: Request):
+        if _user(request):
+            return RedirectResponse("/dashboard", status_code=302)
+        return _login_response()
+
+    @router.post("/login", tags=["auth"])
+    def login_submit(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+    ):
+        admins = _load_admins()
+        if not admins:
+            return _login_response("Нет настроенных аккаунтов. Установите DASHBOARD_ADMIN_PASSWORD в .env")
+        match = any(
+            a.get("username", "").strip() == username.strip()
+            and a.get("password", "") == password
+            for a in admins
+        )
+        if not match:
+            return _login_response("Неверный логин или пароль.")
+        token = secrets.token_hex(32)
+        _sessions[token] = {"username": username.strip(), "created_at": time.time()}
+        resp = RedirectResponse("/dashboard", status_code=302)
+        resp.set_cookie(
+            "dash_token", token,
+            max_age=_SESSION_TTL, httponly=True, samesite="lax",
+        )
+        return resp
+
+    @router.get("/logout", tags=["auth"])
+    def logout(request: Request):
+        token = request.cookies.get("dash_token", "")
+        _sessions.pop(token, None)
+        resp = RedirectResponse("/login", status_code=302)
+        resp.delete_cookie("dash_token")
+        return resp
+
     # ── HTML page ─────────────────────────────────────────────────────────────
     @router.get("/dashboard", response_class=HTMLResponse, tags=["dashboard"])
-    def dashboard_page() -> str:
-        return _DASHBOARD_HTML
+    def dashboard_page(request: Request) -> HTMLResponse:
+        if not _user(request):
+            return RedirectResponse("/login", status_code=302)
+        return HTMLResponse(_DASHBOARD_HTML)
 
     # ── JSON stats API ────────────────────────────────────────────────────────
     @router.get("/api/dashboard/stats", tags=["dashboard"])
@@ -390,11 +486,15 @@ def create_dashboard_router(service) -> APIRouter:
     # ── XLSX Export endpoint ──────────────────────────────────────────────────
     @router.get("/api/dashboard/export", tags=["dashboard"])
     def dashboard_export(
+        request:  Request,
         date_from: str = Query(default=""),
         date_to:   str = Query(default=""),
         group:     str = Query(default=""),
     ):
         import traceback
+        if not _user(request):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
         try:
             from openpyxl import Workbook
             from openpyxl.styles import (Alignment, Border, Font, PatternFill,
@@ -406,7 +506,7 @@ def create_dashboard_router(service) -> APIRouter:
             if not date_to:   date_to   = today
 
             # ── Re-use cached stats (triggers a fetch if needed) ─────────────
-            stats = dashboard_stats(date_from=date_from, date_to=date_to, group=group, force=0)
+            stats = dashboard_stats(request=request, date_from=date_from, date_to=date_to, group=group, force=0)
 
             # ── Re-use cached raw leads for the detail sheet ──────────────
             cache_key = (date_from, date_to)
@@ -620,6 +720,68 @@ def create_dashboard_router(service) -> APIRouter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Login page
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Вход — KPI Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    body { background:#0b1120; font-family:'Inter',system-ui,sans-serif; }
+    input { background:#151f32; border:1px solid #1e2d45; color:#e2e8f0;
+            border-radius:8px; padding:10px 14px; width:100%; font-size:14px;
+            outline:none; transition:border-color .15s; box-sizing:border-box; }
+    input:focus { border-color:#3b82f6; }
+    .btn-login { background:#2563eb; color:#fff; border-radius:8px; padding:11px;
+                 width:100%; font-size:14px; font-weight:600; cursor:pointer;
+                 border:none; transition:background .15s; }
+    .btn-login:hover { background:#1d4ed8; }
+    .err { background:#7f1d1d40; color:#fca5a5; border:1px solid #7f1d1d70;
+           border-radius:8px; padding:10px 14px; font-size:13px; }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div style="width:100%;max-width:380px">
+    <div class="flex items-center gap-3 justify-center mb-8">
+      <div style="width:40px;height:40px;background:#2563eb22;border:1px solid #2563eb44;
+                  border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:20px">📊</div>
+      <div>
+        <div style="color:#f1f5f9;font-weight:700;font-size:18px">Staff KPI Dashboard</div>
+        <div style="color:#475569;font-size:12px">amoCRM — реальное время</div>
+      </div>
+    </div>
+    <div style="background:#151f32;border:1px solid #1e2d45;border-radius:14px;padding:28px 32px">
+      <h2 style="color:#e2e8f0;font-weight:600;margin-bottom:22px;font-size:15px">Вход в систему</h2>
+      {error_block}
+      <form method="post" action="/login">
+        <div style="margin-bottom:14px">
+          <label style="color:#64748b;font-size:11px;text-transform:uppercase;
+                        letter-spacing:.06em;display:block;margin-bottom:6px">Логин</label>
+          <input type="text" name="username" autocomplete="username"
+                 placeholder="Введите логин" required />
+        </div>
+        <div style="margin-bottom:22px">
+          <label style="color:#64748b;font-size:11px;text-transform:uppercase;
+                        letter-spacing:.06em;display:block;margin-bottom:6px">Пароль</label>
+          <input type="password" name="password" autocomplete="current-password"
+                 placeholder="Введите пароль" required />
+        </div>
+        <button type="submit" class="btn-login">Войти</button>
+      </form>
+    </div>
+    <p style="color:#334155;font-size:11px;text-align:center;margin-top:16px">
+      amoCRM → Google Sheets &nbsp;·&nbsp; KPI Dashboard
+    </p>
+  </div>
+</body>
+</html>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Self-contained HTML dashboard page
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -695,6 +857,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     .btn-active-c    { background:#9d174d !important; color:#fce7f3 !important; border-color:#9d174d !important; }
     .btn-active-d    { background:#92400e !important; color:#fde68a !important; border-color:#92400e !important; }
     .btn-active-baza { background:#5b21b6 !important; color:#ede9fe !important; border-color:#5b21b6 !important; }
+    .btn-active-pr   { background:#0e7490 !important; color:#a5f3fc !important; border-color:#0e7490 !important; }
 
     /* ── Summary cards ── */
     .scard { border-radius:14px; padding:18px 20px; display:flex; align-items:center; gap:14px; }
@@ -764,6 +927,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="last-updated" class="text-slate-600 text-xs hidden sm:inline"></span>
       <button id="btn-refresh" class="btn btn-outline text-xs py-1.5" onclick="loadStats(true)">↻ Обновить</button>
       <button id="btn-export"  class="btn btn-outline text-xs py-1.5" style="border-color:#22c55e55;color:#86efac" onclick="exportXlsx()">↓ XLSX</button>
+      <a href="/logout" class="btn btn-outline text-xs py-1.5" style="border-color:#47556944;color:#64748b;text-decoration:none">→ Выйти</a>
       <label class="flex items-center gap-1.5 text-slate-500 text-xs cursor-pointer select-none">
         <input type="checkbox" id="auto-refresh" class="accent-blue-500" onchange="toggleAutoRefresh()" />
         Авто 5 мин
@@ -799,6 +963,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="btn btn-outline text-xs py-1" data-g="C"    onclick="setGroup(this,'C')">C</button>
         <button class="btn btn-outline text-xs py-1" data-g="D"    onclick="setGroup(this,'D')">D</button>
         <button class="btn btn-outline text-xs py-1" data-g="Baza" onclick="setGroup(this,'Baza')">Baza</button>
+        <button class="btn btn-outline text-xs py-1" data-g="__pr__" onclick="setGroup(this,'__pr__')">Приемщики</button>
       </div>
     </div>
 
@@ -891,12 +1056,12 @@ function setPreset(p, btn) {
 }
 
 // ── Group filter ──────────────────────────────────────────────────────────────
-const G_ACTIVE = {'':'btn-active',A:'btn-active-a',B:'btn-active-b',C:'btn-active-c',D:'btn-active-d',Baza:'btn-active-baza'};
+const G_ACTIVE = {'':'btn-active',A:'btn-active-a',B:'btn-active-b',C:'btn-active-c',D:'btn-active-d',Baza:'btn-active-baza','__pr__':'btn-active-pr'};
 
 function setGroup(btn, g) {
   activeGroup = g;
   document.querySelectorAll('#group-btns .btn').forEach(b =>
-    b.classList.remove('btn-active','btn-active-a','btn-active-b','btn-active-c','btn-active-d','btn-active-baza'));
+    b.classList.remove('btn-active','btn-active-a','btn-active-b','btn-active-c','btn-active-d','btn-active-baza','btn-active-pr'));
   btn.classList.add(G_ACTIVE[g] || 'btn-active');
   applyGroupVisibility();
 }
@@ -904,6 +1069,19 @@ function setGroup(btn, g) {
 function applyGroupVisibility() {
   const container = document.getElementById('groups-container');
   const cards     = container.querySelectorAll('.group-card');
+  const ps        = document.getElementById('priemshchik-section');
+  const isPr      = activeGroup === '__pr__';
+
+  // Приемщики mode: hide all group cards, show only priemshchik section
+  if (isPr) {
+    cards.forEach(c => c.classList.add('hidden-group'));
+    container.classList.remove('single-group','two-groups','three-groups');
+    if (ps) ps.classList.remove('hidden');
+    filterStaff();
+    return;
+  }
+
+  // Normal group filter
   let visible = 0;
   cards.forEach(c => {
     const show = !activeGroup || c.dataset.group.toUpperCase() === activeGroup.toUpperCase();
@@ -914,6 +1092,8 @@ function applyGroupVisibility() {
   if (visible === 1)      container.classList.add('single-group');
   else if (visible === 2) container.classList.add('two-groups');
   else if (visible === 3) container.classList.add('three-groups');
+  // Приемщик table only visible in "Все" mode
+  if (ps) ps.classList.toggle('hidden', !!activeGroup);
   filterStaff();
 }
 
@@ -1138,7 +1318,7 @@ function renderPriemshchik(data) {
   const section   = document.getElementById('priemshchik-section');
   const container = document.getElementById('priemshchik-container');
   if (!rows.length) { section.classList.add('hidden'); return; }
-  section.classList.remove('hidden');
+  if (!activeGroup || activeGroup === '__pr__') section.classList.remove('hidden');
 
   const tc = rows.reduce((s,r)=>s+r.consul,0);
   const tz = rows.reduce((s,r)=>s+r.zakas, 0);
