@@ -777,9 +777,9 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
     display_status = STATUS_DISPLAY_MAP.get(status_name, status_name)
     display_pipeline = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
 
-    # Extract contact name and phone from embedded contacts
+    # Extract contact name and ALL phone numbers from embedded contacts
     contact_name = lead.get("name", "")
-    contact_phone = ""
+    _phone_seen: list = []
     contacts = (lead.get("_embedded") or {}).get("contacts") or []
     for contact in contacts:
         if contact.get("name"):
@@ -787,12 +787,11 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
         # custom_fields_values may already be embedded (if fetched with full contact)
         for cf in contact.get("custom_fields_values") or []:
             if cf.get("field_code") == "PHONE" or cf.get("field_name", "").upper() in ("PHONE", "ТЕЛЕФОН"):
-                vals = cf.get("values") or []
-                if vals:
-                    contact_phone = vals[0].get("value", "")
-                    break
-        if contact_phone:
-            break
+                for v in cf.get("values") or []:
+                    num = str(v.get("value", "")).strip()
+                    if num and num not in _phone_seen:
+                        _phone_seen.append(num)
+    contact_phone = ", ".join(_phone_seen)
 
     # Extract company name from embedded companies
     company_name = ""
