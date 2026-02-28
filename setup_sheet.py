@@ -77,9 +77,16 @@ def get_or_create(spreadsheet, name: str, rows: int = 2000, cols: int = 30):
     try:
         ws = spreadsheet.worksheet(name)
         info(f"Worksheet '{name}' already exists.")
+        return ws
     except gspread.WorksheetNotFound:
+        pass
+    try:
         ws = spreadsheet.add_worksheet(title=name, rows=rows, cols=cols)
         ok(f"Created worksheet '{name}'.")
+    except Exception:
+        # Sheet exists in Google but wasn't in the cached metadata — fetch it fresh.
+        ws = spreadsheet.worksheet(name)
+        info(f"Worksheet '{name}' already exists (refreshed from API).")
     return ws
 
 
@@ -237,6 +244,8 @@ def main():
                         help="CSV file (code,name) to populate the Staff sheet")
     parser.add_argument("--check",  action="store_true",
                         help="Verify only — make no changes")
+    parser.add_argument("--skip-staff", action="store_true",
+                        help="Skip Staff sheet setup (use when it already exists)")
     args = parser.parse_args()
 
     mode = "CHECK ONLY" if args.check else "SETUP"
@@ -257,7 +266,10 @@ def main():
                  "(Editor access).")
 
     setup_main_sheet(spreadsheet, check_only=args.check)
-    setup_staff_sheet(spreadsheet, check_only=args.check, csv_path=args.staff)
+    if not args.skip_staff:
+        setup_staff_sheet(spreadsheet, check_only=args.check, csv_path=args.staff)
+    else:
+        info("Skipping Staff sheet setup (--skip-staff).")
 
     print(f"\n{'='*60}")
     print("  All done.")

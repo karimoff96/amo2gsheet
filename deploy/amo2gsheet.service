@@ -1,0 +1,46 @@
+[Unit]
+Description=amoCRM <-> Google Sheets Sync
+Documentation=file:///root/amo2gsheet/SETUP_GUIDE.md
+After=network-online.target
+Wants=network-online.target
+# If cloudflared tunnel is used, wait for it too
+After=cloudflared.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/amo2gsheet
+
+# Use the virtualenv Python directly
+ExecStart=/root/amo2gsheet/venv/bin/python -m uvicorn sync_service:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --no-access-log
+
+# Restart policy — always restart, even on clean exit
+Restart=always
+RestartSec=5
+# Give it 30s to start up before systemd considers it timed out
+TimeoutStartSec=30
+# Give it 10s to shut down gracefully before SIGKILL
+TimeoutStopSec=10
+
+# Rate-limit restarts: if it crashes more than 5 times in 60s, stop trying
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+
+# Log to journald AND file (logrotate handles /var/log/amo2gsheet/)
+StandardOutput=append:/var/log/amo2gsheet/app.log
+StandardError=append:/var/log/amo2gsheet/app.log
+SyslogIdentifier=amo2gsheet
+
+# Basic hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

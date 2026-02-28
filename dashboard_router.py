@@ -17,8 +17,15 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse
 
-# ── Status display names that count as "reached Заказ" for KPI ───────────────
-ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ"}
+# ── Status display names that count as a confirmed order for KPI ─────────────
+# Includes every stage at or beyond "Заказ" — the order has been placed.
+ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ", "В процессе", "У курера", "Успешно"}
+
+# Statuses that count as rejection
+OTKAZ_DISPLAY_NAMES: set[str] = {"Отказ", "Закрыто и не реализовано"}
+
+# Statuses that count as consideration (lead is thinking/hesitating)
+DUMKA_DISPLAY_NAMES: set[str] = {"Раздумье"}
 
 
 def _norm(name: str) -> str:
@@ -47,7 +54,8 @@ def create_dashboard_router(service) -> APIRouter:
     ) -> Dict[str, Any]:
         import traceback
         _empty = {"groups": {}, "date_from": date_from, "date_to": date_to,
-                  "total_consul": 0, "total_zakas": 0, "total_summa": 0, "avg_conversion": 0.0}
+                  "total_consul": 0, "total_zakas": 0, "total_otkaz": 0, "total_dumka": 0,
+                  "total_summa": 0, "avg_conversion": 0.0}
         try:
             today = date.today().strftime("%Y-%m-%d")
             if not date_from:
@@ -56,16 +64,17 @@ def create_dashboard_router(service) -> APIRouter:
                 date_to = today
 
             # ── 1. Load Staff sheet: code → {code, group, full_name} ──────────
+            # Staff sheet columns: №(0) | Код сотрудника(1) | Сотрудник(2) | Отдел(3)
             staff_by_code: Dict[str, Dict] = {}
             try:
                 ws = service.sheet._get_or_create_sheet("Staff")
                 rows = ws.get_all_values()
                 for row in rows[1:]:
-                    if len(row) < 2:
+                    if len(row) < 3:
                         continue
-                    code      = str(row[0]).strip()
-                    full_name = str(row[1]).strip()
-                    dept      = str(row[2]).strip() if len(row) >= 3 else ""
+                    code      = str(row[1]).strip()  # Код сотрудника
+                    full_name = str(row[2]).strip()  # Сотрудник
+                    dept      = str(row[3]).strip() if len(row) >= 4 else ""
                     if not full_name or not code:
                         continue
                     info = {"code": code, "group": dept, "full_name": full_name}
@@ -77,6 +86,17 @@ def create_dashboard_router(service) -> APIRouter:
             except Exception as exc:
                 print(f"[DASHBOARD] Could not load Staff sheet: {exc}")
 
+            # ── 1b. Build sotuv (sales) pipeline ID set for filtering ─────────
+            pipeline_keyword = getattr(service.cfg, "PIPELINE_KEYWORD", "sotuv").lower()
+            sotuv_pipeline_ids: set[int] = set()
+            if pipeline_keyword:
+                for pid, pname in service.pipeline_id_to_name.items():
+                    if pipeline_keyword in pname.lower():
+                        sotuv_pipeline_ids.add(pid)
+            # If keyword matches nothing, fall back to all pipelines
+            if not sotuv_pipeline_ids:
+                sotuv_pipeline_ids = set(service.pipeline_id_to_name.keys())
+
             # ── 2. Fetch leads from AMO ───────────────────────────────────────
             leads = service.amo.fetch_leads_by_date_range(date_from, date_to)
 
@@ -86,11 +106,28 @@ def create_dashboard_router(service) -> APIRouter:
             skipped_unknown = 0  # leads whose code isn't in the Staff sheet
 
             for lead in leads:
+                # ── pipeline filter: only sotuv leads ─────────────────────────
+                lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
+                if sotuv_pipeline_ids and lead_pipeline_id not in sotuv_pipeline_ids:
+                    continue
+
                 status_id      = int(lead.get("status_id", 0) or 0)
                 status_display = service.status_id_to_display_name.get(status_id, "")
                 budget         = float(lead.get("price", 0) or 0)
                 is_zakas       = status_display in ZAKAS_DISPLAY_NAMES
+                is_otkaz       = status_display in OTKAZ_DISPLAY_NAMES
+                is_dumka       = status_display in DUMKA_DISPLAY_NAMES
                 cf_values      = lead.get("custom_fields_values") or []
+
+                # ── Extract "Группа" custom field (fallback group source) ─────
+                lead_group_override = ""
+                for cf in cf_values:
+                    fname = " ".join((cf.get("field_name") or "").split())
+                    if fname == "Группа":
+                        vals = cf.get("values") or []
+                        if vals:
+                            lead_group_override = str(vals[0].get("value", "")).strip()
+                        break
 
                 # ── 3a. Приемщик aggregation (runs for ALL leads) ─────────────
                 for cf in cf_values:
@@ -105,12 +142,18 @@ def create_dashboard_router(service) -> APIRouter:
                                         "name":   p_name,
                                         "consul": 0,
                                         "zakas":  0,
+                                        "otkaz":  0,
+                                        "dumka":  0,
                                         "summa":  0.0,
                                     }
                                 priemshchik_stats[p_name]["consul"] += 1
                                 if is_zakas:
                                     priemshchik_stats[p_name]["zakas"] += 1
                                     priemshchik_stats[p_name]["summa"] += budget
+                                if is_otkaz:
+                                    priemshchik_stats[p_name]["otkaz"] += 1
+                                if is_dumka:
+                                    priemshchik_stats[p_name]["dumka"] += 1
                         break
 
                 # ── 3b. Staff aggregation (only leads with valid Код сотрудника) ─
@@ -139,7 +182,8 @@ def create_dashboard_router(service) -> APIRouter:
                     skipped_unknown += 1
                     continue
 
-                dept         = staff_info["group"]
+                # Use dept from Staff sheet; fall back to lead's "Группа" custom field
+                dept         = staff_info["group"] or lead_group_override
                 display_name = staff_info["full_name"]
 
                 if norm_code not in user_stats:
@@ -149,19 +193,30 @@ def create_dashboard_router(service) -> APIRouter:
                         "group":  dept,
                         "consul": 0,
                         "zakas":  0,
+                        "otkaz":  0,
+                        "dumka":  0,
                         "summa":  0.0,
                     }
+                # If same staff, update group if blank (later Группа field may fill it)
+                elif not user_stats[norm_code]["group"] and dept:
+                    user_stats[norm_code]["group"] = dept
 
                 user_stats[norm_code]["consul"] += 1
                 if is_zakas:
                     user_stats[norm_code]["zakas"] += 1
                     user_stats[norm_code]["summa"] += budget
+                if is_otkaz:
+                    user_stats[norm_code]["otkaz"] += 1
+                if is_dumka:
+                    user_stats[norm_code]["dumka"] += 1
 
             # ── 4. Build staff rows with conversion ────────────────────────────
             rows_out: List[Dict] = []
             for st in user_stats.values():
                 consul = st["consul"]
                 zakas  = st["zakas"]
+                otkaz  = st["otkaz"]
+                dumka  = st["dumka"]
                 conv   = round(zakas / consul * 100, 1) if consul else 0.0
                 rows_out.append({
                     "code":       st["code"],
@@ -169,6 +224,8 @@ def create_dashboard_router(service) -> APIRouter:
                     "group":      st["group"],
                     "summa":      int(st["summa"]),
                     "zakas":      zakas,
+                    "otkaz":      otkaz,
+                    "dumka":      dumka,
                     "consul":     consul,
                     "conversion": conv,
                 })
@@ -192,6 +249,8 @@ def create_dashboard_router(service) -> APIRouter:
             # ── 8. Totals ─────────────────────────────────────────────────────
             all_consul = sum(r["consul"] for r in rows_out)
             all_zakas  = sum(r["zakas"]  for r in rows_out)
+            all_otkaz  = sum(r["otkaz"]  for r in rows_out)
+            all_dumka  = sum(r["dumka"]  for r in rows_out)
             all_summa  = sum(r["summa"]  for r in rows_out)
             avg_conv   = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
 
@@ -200,11 +259,15 @@ def create_dashboard_router(service) -> APIRouter:
             for st in priemshchik_stats.values():
                 consul = st["consul"]
                 zakas  = st["zakas"]
+                otkaz  = st["otkaz"]
+                dumka  = st["dumka"]
                 conv   = round(zakas / consul * 100, 1) if consul else 0.0
                 priemshchik_rows.append({
                     "name":       st["name"],
                     "summa":      int(st["summa"]),
                     "zakas":      zakas,
+                    "otkaz":      otkaz,
+                    "dumka":      dumka,
                     "consul":     consul,
                     "conversion": conv,
                 })
@@ -217,6 +280,8 @@ def create_dashboard_router(service) -> APIRouter:
                 "date_to":         date_to,
                 "total_consul":    all_consul,
                 "total_zakas":     all_zakas,
+                "total_otkaz":     all_otkaz,
+                "total_dumka":     all_dumka,
                 "total_summa":     all_summa,
                 "avg_conversion":  avg_conv,
                 "skipped_unknown": skipped_unknown,
@@ -258,10 +323,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     .conv-mid  { color: #facc15; font-weight: 600; }
     .conv-low  { color: #f87171; font-weight: 600; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 700; }
-    .badge-a { background: #1d4ed8; color: #bfdbfe; }
-    .badge-b { background: #15803d; color: #bbf7d0; }
-    .badge-c { background: #9d174d; color: #fce7f3; }
-    .badge-d { background: #92400e; color: #fde68a; }
+    .badge-a    { background: #1d4ed8; color: #bfdbfe; }
+    .badge-b    { background: #15803d; color: #bbf7d0; }
+    .badge-c    { background: #9d174d; color: #fce7f3; }
+    .badge-d    { background: #92400e; color: #fde68a; }
+    .badge-baza { background: #5b21b6; color: #ede9fe; }
+    .group-header-baza { background: #2e1065; }
+    .btn-active-baza { background: #5b21b6 !important; color: #ede9fe !important; border-color: #5b21b6 !important; }
     input[type="date"] {
       background: #1e293b; border: 1px solid #334155; color: #e2e8f0;
       border-radius: 6px; padding: 6px 10px; font-size: 13px;
@@ -347,12 +415,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Group tabs -->
     <div>
       <label class="block text-xs text-slate-400 mb-1">Группа</label>
-      <div class="flex gap-1.5" id="group-btns">
-        <button class="btn btn-outline btn-active" data-g="" onclick="setGroup(this, '')">Все</button>
-        <button class="btn btn-outline" data-g="A"  onclick="setGroup(this, 'A')">A</button>
-        <button class="btn btn-outline" data-g="B"  onclick="setGroup(this, 'B')">B</button>
-        <button class="btn btn-outline" data-g="C"  onclick="setGroup(this, 'C')">C</button>
-        <button class="btn btn-outline" data-g="D"  onclick="setGroup(this, 'D')">D</button>
+      <div class="flex gap-1.5 flex-wrap" id="group-btns">
+        <button class="btn btn-outline btn-active" data-g="" onclick="setGroup(this, ''")Все</button>
+        <button class="btn btn-outline" data-g="A"    onclick="setGroup(this, 'A')">A</button>
+        <button class="btn btn-outline" data-g="B"    onclick="setGroup(this, 'B')">B</button>
+        <button class="btn btn-outline" data-g="C"    onclick="setGroup(this, 'C')">C</button>
+        <button class="btn btn-outline" data-g="D"    onclick="setGroup(this, 'D')">D</button>
+        <button class="btn btn-outline" data-g="Baza" onclick="setGroup(this, 'Baza')">Baza</button>
       </div>
     </div>
 
@@ -366,7 +435,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ── Summary Cards ────────────────────────────────────────────────────── -->
-  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+  <div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-5">
     <div class="card p-4 text-center">
       <div class="text-2xl font-bold text-blue-400" id="s-consul">—</div>
       <div class="text-xs text-slate-400 mt-1">Лиды (консультация)</div>
@@ -374,6 +443,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card p-4 text-center">
       <div class="text-2xl font-bold text-green-400" id="s-zakas">—</div>
       <div class="text-xs text-slate-400 mt-1">Лиды (заказ)</div>
+    </div>
+    <div class="card p-4 text-center">
+      <div class="text-2xl font-bold text-red-400" id="s-otkaz">—</div>
+      <div class="text-xs text-slate-400 mt-1">Отказы</div>
     </div>
     <div class="card p-4 text-center">
       <div class="text-2xl font-bold text-yellow-400" id="s-summa">—</div>
@@ -443,7 +516,7 @@ function setPreset(p) {
 }
 
 // ── Group filter (client-side only — no extra API call) ───────────────────────
-const GROUP_ACTIVE_CLS = { '': 'btn-active', A: 'btn-active-a', B: 'btn-active-b', C: 'btn-active-c', D: 'btn-active-d' };
+const GROUP_ACTIVE_CLS = { '': 'btn-active', A: 'btn-active-a', B: 'btn-active-b', C: 'btn-active-c', D: 'btn-active-d', Baza: 'btn-active-baza' };
 
 function setGroup(btn, g) {
   activeGroup = g;
@@ -527,14 +600,13 @@ async function loadStats() {
 // ── Summary cards ──────────────────────────────────────────────────────────────
 function renderSummary(data) {
   document.getElementById('s-consul').textContent = fmtNum(data.total_consul);
-  document.getElementById('s-zakas').textContent  = fmtNum(data.total_zakas);
-  document.getElementById('s-summa').textContent  = fmtMoney(data.total_summa);
+  document.getElementById('s-zakas').textContent  = fmtNum(data.total_zakas);  document.getElementById('s-otkaz').textContent  = fmtNum(data.total_otkaz || 0);  document.getElementById('s-summa').textContent  = fmtMoney(data.total_summa);
   document.getElementById('s-conv').textContent   = data.avg_conversion + '%';
 }
 
 // ── Group tables ───────────────────────────────────────────────────────────────
-const GROUP_COLORS = { A:'badge-a', B:'badge-b', C:'badge-c', D:'badge-d' };
-const GROUP_HDR    = { A:'group-header', B:'group-header-b', C:'group-header-c', D:'group-header-d' };
+const GROUP_COLORS = { A:'badge-a', B:'badge-b', C:'badge-c', D:'badge-d', BAZA:'badge-baza' };
+const GROUP_HDR    = { A:'group-header', B:'group-header-b', C:'group-header-c', D:'group-header-d', BAZA:'group-header-baza' };
 
 function renderGroups(data) {
   const container = document.getElementById('groups-container');
@@ -542,8 +614,8 @@ function renderGroups(data) {
   container.innerHTML = '';
 
   const groups = data.groups || {};
-  // Always render in fixed order A → B → C → D, then any others
-  const ORDER = ['A','B','C','D'];
+  // Always render in fixed order A → B → C → D → Baza, then any others
+  const ORDER = ['A','B','C','D','Baza'];
   const keys  = [...ORDER.filter(k => groups[k]), ...Object.keys(groups).filter(k => !ORDER.includes(k)).sort()];
 
   if (keys.length === 0) { emptyMsg.classList.remove('hidden'); return; }
@@ -551,11 +623,12 @@ function renderGroups(data) {
 
   for (const g of keys) {
     const rows      = groups[g];
-    const badgeCls  = GROUP_COLORS[g.toUpperCase()] || 'badge-a';
+    const badgeCls  = GROUP_COLORS[g.toUpperCase()] || 'badge-baza';
     const hdrCls    = GROUP_HDR[g.toUpperCase()]    || 'group-header';
-    const tc = rows.reduce((s,r)=>s+r.consul,0);
-    const tz = rows.reduce((s,r)=>s+r.zakas, 0);
-    const ts = rows.reduce((s,r)=>s+r.summa, 0);
+    const tc = rows.reduce((s,r)=>s+r.consul, 0);
+    const tz = rows.reduce((s,r)=>s+r.zakas,  0);
+    const to = rows.reduce((s,r)=>s+(r.otkaz||0), 0);
+    const ts = rows.reduce((s,r)=>s+r.summa,  0);
     const tv = tc ? Math.round(tz/tc*1000)/10 : 0;
 
     const card = document.createElement('div');
@@ -577,6 +650,7 @@ function renderGroups(data) {
             <th class="text-left">Сотрудник</th>
             <th class="text-right">Сумма</th>
             <th class="text-right">Заказ</th>
+            <th class="text-right">Отказ</th>
             <th class="text-right">Консульт.</th>
             <th class="text-right">Конв.</th>
           </tr></thead>
@@ -586,6 +660,7 @@ function renderGroups(data) {
               <td colspan="2" class="px-2 py-2 text-xs text-slate-400 font-semibold">Итого</td>
               <td class="px-2 py-2 text-right text-xs font-bold text-yellow-300">${fmtMoney(ts)}</td>
               <td class="px-2 py-2 text-right text-xs font-bold text-green-300">${tz}</td>
+              <td class="px-2 py-2 text-right text-xs font-bold text-red-300">${to}</td>
               <td class="px-2 py-2 text-right text-xs font-bold text-blue-300">${tc}</td>
               <td class="px-2 py-2 text-right text-xs font-bold ${convCls(tv)}">${tv}%</td>
             </tr>
@@ -605,6 +680,7 @@ function rowHtml(r) {
     </td>
     <td class="text-right text-yellow-300 font-semibold text-xs">${fmtMoney(r.summa)}</td>
     <td class="text-right text-green-300 font-semibold text-xs">${r.zakas}</td>
+    <td class="text-right text-red-300 text-xs">${r.otkaz||0}</td>
     <td class="text-right text-blue-300 text-xs">${r.consul}</td>
     <td class="text-right text-xs ${convCls(r.conversion)}">${r.conversion}%</td>
   </tr>`;
@@ -624,6 +700,7 @@ function renderPriemshchik(data) {
   const ts = rows.reduce((s,r)=>s+r.summa,  0);
   const tv = tc ? Math.round(tz/tc*1000)/10 : 0;
 
+  const tp = rows.reduce((s,r)=>s+(r.otkaz||0), 0);
   container.innerHTML = `
     <div class="group-header px-3 py-2.5 flex items-center justify-between">
       <span class="font-bold text-white text-sm">Приемщики</span>
@@ -636,6 +713,7 @@ function renderPriemshchik(data) {
           <th class="text-left">Приемщик</th>
           <th class="text-right">Сумма</th>
           <th class="text-right">Заказ</th>
+          <th class="text-right">Отказ</th>
           <th class="text-right">Консультация</th>
           <th class="text-right">Конв.</th>
         </tr></thead>
@@ -645,6 +723,7 @@ function renderPriemshchik(data) {
             <td class="font-medium text-white text-xs">${r.name}</td>
             <td class="text-right text-yellow-300 font-semibold text-xs">${fmtMoney(r.summa)}</td>
             <td class="text-right text-green-300 font-semibold text-xs">${r.zakas}</td>
+            <td class="text-right text-red-300 text-xs">${r.otkaz||0}</td>
             <td class="text-right text-blue-300 text-xs">${r.consul}</td>
             <td class="text-right text-xs ${convCls(r.conversion)}">${r.conversion}%</td>
           </tr>`).join('')}
@@ -654,6 +733,7 @@ function renderPriemshchik(data) {
             <td colspan="2" class="px-2 py-2 text-xs text-slate-400 font-semibold">Итого</td>
             <td class="px-2 py-2 text-right text-xs font-bold text-yellow-300">${fmtMoney(ts)}</td>
             <td class="px-2 py-2 text-right text-xs font-bold text-green-300">${tz}</td>
+            <td class="px-2 py-2 text-right text-xs font-bold text-red-300">${tp}</td>
             <td class="px-2 py-2 text-right text-xs font-bold text-blue-300">${tc}</td>
             <td class="px-2 py-2 text-right text-xs font-bold ${convCls(tv)}">${tv}%</td>
           </tr>

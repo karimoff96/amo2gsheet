@@ -29,6 +29,9 @@ _ENV_SCOPED_KEYS = [
     "GOOGLE_SERVICE_ACCOUNT_FILE",
     "GOOGLE_SHEET_ID",
     "GOOGLE_WORKSHEET_NAME",
+    # Trigger status names can differ between dev and prod AMO accounts.
+    "TRIGGER_STATUS_NAME",
+    "TRIGGER_STATUS_NAMES",
 ]
 
 

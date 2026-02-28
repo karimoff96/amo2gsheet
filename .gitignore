@@ -1,8 +1,23 @@
 ﻿venv/
 .env
 gsheet.json
+*.json.key
+# Credential files — never commit
+dev_gsheet.json
+prod_gsheet.json
+# Token stores — auto-generated, contain secrets
 .amo_tokens.json
+.amo_tokens_dev.json
+.amo_tokens_prod.json
+# Runtime state — auto-generated
 .sync_state.json
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+# Temp / scratch files
 data.xlsx
+*.xlsx
+*.csv
+.prod_gsheet.xlsx
+.dev_gsheet.xlsx

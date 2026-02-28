@@ -3,11 +3,10 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
-
 import gspread
 import requests
 from env_loader import load_env
@@ -67,6 +66,8 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
     "ЗАКАЗ":                      "Заказ",
     "NOMERATSIYALANMAGAN ZAKAZ":  "В процессе",
     "Заказ без нумерации":        "В процессе",
+    "ЗАКАЗ БЕЗ НУМЕРАЦИИ":       "В процессе",
+    "ЗАЗАЗ БЕЗ НУМЕРАЦИИ":       "В процессе",
     "ЗАКАЗ ОТПРАВЛЕН":            "У курера",
     "Заказ отправлен":            "У курера",
     "OTKAZ":                      "Отказ",
@@ -104,6 +105,31 @@ AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
 }
 
 
+def _parse_leads_created_after(raw: str) -> int:
+    """Accept a Unix timestamp integer OR a human-readable date/time string (UTC).
+
+    Supported formats:
+      - '27.02.2026 00:00:00'  (DD.MM.YYYY HH:MM:SS)
+      - '27.02.2026 00:00'     (DD.MM.YYYY HH:MM)
+      - '2026-02-27 00:00:00'  (YYYY-MM-DD HH:MM:SS)
+      - '2026-02-27'           (YYYY-MM-DD)
+      - '1772121600'           (plain Unix timestamp)
+      - '0' or empty          → process all leads
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "0":
+        return 0
+    if raw.isdigit():
+        return int(raw)
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            continue
+    print(f"[WARN] LEADS_CREATED_AFTER='{raw}' is not a recognized format. Using 0.")
+    return 0
+
+
 class Config:
     AMO_SUBDOMAIN = os.getenv("AMO_SUBDOMAIN", "").strip()
     AMO_CLIENT_ID = os.getenv("AMO_CLIENT_ID", "").strip()
@@ -134,8 +160,6 @@ class Config:
     # Initial date-range sync: YYYY-MM-DD strings. Both must be set to activate.
     INITIAL_SYNC_DATE_FROM = os.getenv("INITIAL_SYNC_DATE_FROM", "").strip()
     INITIAL_SYNC_DATE_TO   = os.getenv("INITIAL_SYNC_DATE_TO",   "").strip()
-    # Unix timestamp – webhook leads created BEFORE this are silently ignored. 0 = process all.
-    LEADS_CREATED_AFTER = int(os.getenv("LEADS_CREATED_AFTER", "0"))
     # Minimum seconds between consecutive amoCRM API calls. Increase on prod if you see 429s.
     AMO_REQUEST_DELAY_SEC = float(os.getenv("AMO_REQUEST_DELAY_SEC", "0.2"))
     # How long (seconds) the Staff sheet mapping is cached before re-fetching.
@@ -143,6 +167,12 @@ class Config:
     # If the same (lead_id, status_id) webhook arrives again within this window, skip it.
     # Prevents repeated AMO API calls caused by amoCRM’s own webhook retry logic.
     WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("WEBHOOK_DEDUP_TTL_SEC", "60"))
+    # Leads created before this timestamp are silently ignored (0 = process all).
+    # Supports human-readable 'DD.MM.YYYY HH:MM:SS' (UTC) or plain Unix timestamp.
+    LEADS_CREATED_AFTER = _parse_leads_created_after(os.getenv("LEADS_CREATED_AFTER", "0"))
+    # Only process leads from pipelines whose name contains this keyword (case-insensitive).
+    # New pipelines matching the keyword are picked up automatically. Empty = all pipelines.
+    PIPELINE_KEYWORD = os.getenv("PIPELINE_KEYWORD", "").strip().lower()
 
 
 def require_env() -> None:
@@ -414,6 +444,8 @@ class SheetSync:
     def _get_or_create_sheet(self, name: str):
         if name in self._sheets:
             return self._sheets[name]
+        # Always re-fetch spreadsheet metadata first to avoid stale cache issues
+        self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
         try:
             ws = self.spreadsheet.worksheet(name)
         except gspread.WorksheetNotFound:
@@ -472,17 +504,19 @@ class SheetSync:
             ws = self._get_or_create_sheet("Staff")
             values = ws.get_all_values()
             mapping = {}
+            # Staff sheet columns: №(0) | Код сотрудника(1) | Сотрудник(2) | Отдел(3)
             for row in values[1:]:  # Skip header
-                if len(row) >= 2:
-                    code = str(row[0]).strip()
-                    name = str(row[1]).strip()
+                if len(row) >= 3:
+                    code = str(row[1]).strip()
+                    name = str(row[2]).strip()
                     if code and name:
-                        # Store the code without leading zeros to ensure matching
+                        # Store with and without leading zeros for flexible matching
                         try:
-                            code = str(int(code))
+                            code_int = str(int(code))
                         except ValueError:
-                            pass
-                        mapping[code] = name
+                            code_int = code
+                        mapping[code] = name        # e.g. "0134" → name
+                        mapping[code_int] = name    # e.g. "134"  → name
             self._staff_cache = mapping
             self._staff_cache_ts = now
             return mapping
@@ -959,6 +993,10 @@ class SyncService:
             status_id     = int(lead.get("status_id", 0) or 0)
             pipeline_id   = int(lead.get("pipeline_id", 0) or 0)
             pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
+            # Skip pipelines not matching the keyword filter (e.g. only "sotuv" pipelines).
+            if self.cfg.PIPELINE_KEYWORD and self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
+                skipped += 1
+                continue
             pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
 
             # Resolve status display name via the same map used by webhooks.
@@ -1098,11 +1136,18 @@ class SyncService:
                 full_lead = lead
                 status_id = webhook_status_id
 
-            # Skip leads created before the configured cutoff (useful on prod to ignore old history)
+            # Skip leads last updated before the configured cutoff (ignores stale history)
             if self.cfg.LEADS_CREATED_AFTER:
-                created_at = int(full_lead.get("created_at", 0) or 0)
-                if created_at and created_at < self.cfg.LEADS_CREATED_AFTER:
+                updated_at = int(full_lead.get("updated_at", 0) or 0)
+                if updated_at and updated_at < self.cfg.LEADS_CREATED_AFTER:
                     skipped_too_old += 1
+                    continue
+
+            # Skip leads from pipelines not matching the keyword filter.
+            if self.cfg.PIPELINE_KEYWORD:
+                wh_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
+                wh_pipeline_name = self.pipeline_id_to_name.get(wh_pipeline_id, "")
+                if self.cfg.PIPELINE_KEYWORD not in wh_pipeline_name.lower():
                     continue
 
             if status_id in self.trigger_status_ids:
@@ -1205,9 +1250,15 @@ class SyncService:
                             {
                                 "status_id": status_id,
                                 "pipeline_id": lead_pipeline_id or self.cfg.PIPELINE_ID,
+                                "custom_fields_values": [
+                                    {
+                                        "field_id": 987889,
+                                        "values": [{"value": order_number}],
+                                    }
+                                ],
                             },
                         )
-                        print(f"[INFO] Lead {lead_id}: Заказ № filled ('{order_number}') → moved to Заказ отправлен in AMO")
+                        print(f"[INFO] Lead {lead_id}: Заказ № filled ('{order_number}') → set in AMO + moved to Заказ отправлен")
                     else:
                         print(f"[WARN] Lead {lead_id}: Заказ № filled but could not find 'Заказ отправлен' status ID for pipeline {lead_pipeline_id}")
                     # Remember new order number regardless (avoids re-triggering)

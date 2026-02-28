@@ -16,7 +16,7 @@ Follow the steps in order.
 7. [Inspect the AMO account (pipeline & status IDs)](#7-inspect-the-amo-account)
 8. [Update sync_service.py maps for your pipelines](#8-update-sync_servicepy-maps)
 9. [Initialise the Google Sheet](#9-initialise-the-google-sheet)
-10. [Start the service](#10-start-the-service)
+10. [Start the service (production)](#10-start-the-service)
 11. [Register the webhook in amoCRM](#11-register-the-webhook-in-amocrm)
 12. [Test everything end-to-end](#12-test-everything-end-to-end)
 13. [Ongoing maintenance](#13-ongoing-maintenance)
@@ -56,6 +56,10 @@ A **service account** is a bot Google account the service uses to write to your 
 
 4. (Optional) Create a second tab named **Staff** for the employee code → name mapping.
    The `setup_sheet.py` script will create it automatically if it doesn't exist.
+
+> **Staff sheet column layout** (must be exactly in this order):
+> `№ | Код сотрудника | Сотрудник | Отдел`  
+> Codes like `0134` are matched with or without leading zeros.
 
 ---
 
@@ -134,7 +138,9 @@ Leave these for now — you will fill them after step 7:
 
 ```ini
 TRIGGER_STATUS_NAME=              # fill after step 7
-LEADS_CREATED_AFTER=0             # fill after step 7
+TRIGGER_STATUS_NAMES=             # extra trigger names if different pipelines use different names
+PIPELINE_KEYWORD=sotuv            # only process pipelines whose name contains this (leave empty = all)
+LEADS_CREATED_AFTER=0             # fill after step 7 — leads last updated before this are skipped
 ```
 
 Production tuning (adjust as needed):
@@ -260,8 +266,12 @@ Then update `.env`:
 
 ```ini
 TRIGGER_STATUS_NAME=MY PROD TRIGGER STATUS    # exact value from PIPELINES & STATUSES
-LEADS_CREATED_AFTER=1740787200                # timestamp from inspect_amo.py hints
+TRIGGER_STATUS_NAMES=TYPO VARIANT NAME        # comma-separated, if different pipelines use different names
+PIPELINE_KEYWORD=sotuv                        # only process matching pipelines
+LEADS_CREATED_AFTER=27.02.2026 00:00:00       # leads last updated before this are skipped
 ```
+
+> **Note**: `LEADS_CREATED_AFTER` filters by `updated_at`, not `created_at`. A lead created months ago but moved to the trigger status after this date **will** be processed.
 
 ---
 
@@ -282,87 +292,85 @@ python setup_sheet.py --staff staff.csv
 python setup_sheet.py --check
 ```
 
-### staff.csv format
+### Staff sheet format
 
-```csv
-101,Нилуфар Каримова
-102,Мунира Хасанова
-103,Акобир Рашидов
+The **Staff** tab must have exactly these 4 columns with a header row:
+
+```
+№ | Код сотрудника | Сотрудник | Отдел
+1   0134             BAHODIR HUSANOV    A
+2   0144             ELYORBEK ISOQULOV  A
 ```
 
-The **Staff** sheet maps employee codes (from AMO's "Код сотрудника" field) to display names in the "Ответственный" column of the main sheet.
+Employee codes from AMO's `Код ID` field are looked up here to populate the **Ответственный** column. Codes are matched with or without leading zeros.
 
 ---
 
 ## 10. Start the service
 
-### Option A — foreground (for testing)
+### Option A — foreground (for quick testing only)
 
 ```bash
 cd /root/amo2gsheet
 source venv/bin/activate
-python sync_service.py
+python -m uvicorn sync_service:app --host 0.0.0.0 --port 8000
 ```
 
-### Option B — systemd (production)
+### Option B — production (recommended): use the deploy script
+
+The `deploy/` folder contains ready-made systemd + Cloudflare Tunnel configs with full fault tolerance.
 
 ```bash
-sudo nano /etc/systemd/system/amo2gsheet.service
+bash deploy/deploy.sh
 ```
 
-```ini
-[Unit]
-Description=amoCRM <-> Google Sheets Sync
-After=network.target
+This single command:
+- Installs Cloudflare Tunnel (`cloudflared`)
+- Creates a Python virtualenv and installs dependencies
+- Installs `deploy/amo2gsheet.service` → systemd with `Restart=always`
+- Installs `deploy/cloudflared.service` → tunnel auto-restarts too
+- Installs log rotation (daily, 14-day retention)
+- Enables both services on boot and starts them
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/amo2gsheet
-ExecStart=/root/amo2gsheet/venv/bin/python sync_service.py
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-Environment=PYTHONUNBUFFERED=1
+**Fault tolerance built in:**
 
-[Install]
-WantedBy=multi-user.target
-```
+| Feature | Detail |
+|---|---|
+| Auto-restart on crash | `Restart=always`, `RestartSec=5` |
+| Boot auto-start | `systemctl enable amo2gsheet` |
+| Starts after network | `After=network-online.target` |
+| Crash loop protection | Max 5 restarts per 60 s, then alert |
+| Graceful shutdown | 10 s to flush before SIGKILL |
+| Log rotation | Daily, compressed, 14 days retained |
+
+### Get a permanent public HTTPS URL (required for webhooks)
+
+amoCRM webhooks require HTTPS. Use a **Named Cloudflare Tunnel** — it is free, permanent, and survives server reboots:
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable amo2gsheet
-sudo systemctl start amo2gsheet
+# 1. Log in to Cloudflare (opens browser)
+cloudflared tunnel login
 
-# Check status
-sudo systemctl status amo2gsheet
+# 2. Create a named tunnel
+cloudflared tunnel create amo2gsheet
 
-# Live logs
-sudo journalctl -u amo2gsheet -f
+# 3. Route a hostname to it (requires a domain on your Cloudflare account)
+cloudflared tunnel route dns amo2gsheet webhook.yourdomain.com
+
+# 4. Copy the tunnel token shown after step 2, then set it in
+nano deploy/cloudflared.service
+# Replace YOUR_TUNNEL_TOKEN_HERE with the actual token
+
+# 5. Install and start the cloudflared service
+cp deploy/cloudflared.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now cloudflared
 ```
 
-### Get a public HTTPS URL (required for webhooks)
+Your permanent webhook URL will be: `https://webhook.yourdomain.com/webhook/amocrm`
 
-amoCRM webhooks require HTTPS. The easiest no-domain solution is Cloudflare Tunnel:
-
-```bash
-# Install
-curl -L https://pkg.cloudflare.com/cloudflare-main.gpg \
-  | sudo tee /usr/share/keyrings/cloudflare-main.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
-  https://pkg.cloudflare.com/cloudflared any main" \
-  | sudo tee /etc/apt/sources.list.d/cloudflared.list
-sudo apt update && sudo apt install -y cloudflared
-
-# Start a temporary tunnel (gives you https://xxxx.trycloudflare.com)
-cloudflared tunnel --url http://localhost:8000
-```
-
-Save the `https://xxxx.trycloudflare.com` URL — you will register it in the next step.
-
-> For a **permanent URL** without a domain:  
-> Create a free Cloudflare account and set up a [Named Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/).
+> **No domain?** Use a temporary tunnel for testing: `cloudflared tunnel --url http://localhost:8000`  
+> This gives a random `xxxx.trycloudflare.com` URL that changes on each restart.
 
 ---
 
@@ -371,13 +379,13 @@ Save the `https://xxxx.trycloudflare.com` URL — you will register it in the ne
 1. Log in to amoCRM → **Settings → Integrations → Webhooks**.
 2. Click **Add webhook**.
 3. Fill in:
-   - **URL**: `https://xxxx.trycloudflare.com/webhook/amocrm`
-   - **Events**: ✅ **Lead status changed** (and optionally Lead added, Lead updated)
+   - **URL**: `https://webhook.yourdomain.com/webhook/amocrm`
+   - **Events**: ✅ **Lead status changed** only — uncheck everything else to avoid a flood of unnecessary POST requests
 4. Click **Save**.
 
-To verify it's working:
+Verify connectivity:
 ```bash
-curl https://xxxx.trycloudflare.com/health
+curl https://webhook.yourdomain.com/health
 # Expected: {"status":"ok"}
 ```
 
@@ -388,8 +396,8 @@ curl https://xxxx.trycloudflare.com/health
 1. Open your amoCRM account.
 2. Move any test lead to the trigger status (e.g. `NOMERATSIYALANMAGAN ZAKAZ`).
 3. Within a few seconds, open the Google Sheet — a new row should appear with status **"В процессе"**.
-4. Change the "статус" dropdown on that row to **"У курера"**.
-5. Wait up to `SYNC_POLL_SECONDS` (default 30s) — the lead should move to **Заказ отправлен** in AMO.
+4. Fill in the **Заказ №** field on that row — within `SYNC_POLL_SECONDS` the order number should appear in AMO and the lead should move to **Заказ отправлен**.
+5. Change the **Статус** dropdown to **"У курера"** — the lead should move to the won step in AMO.
 
 If a row does not appear, check the logs:
 ```bash
@@ -413,52 +421,56 @@ Common issues:
 ### Update the code
 
 ```bash
-cd /root/amo2gsheet
-# Download updated files from local machine:
-scp sync_service.py root@1.2.3.4:/root/amo2gsheet/
-sudo systemctl restart amo2gsheet
+# From your local machine — copy changed files then restart:
+scp sync_service.py root@SERVER_IP:/root/amo2gsheet/
+ssh root@SERVER_IP 'systemctl restart amo2gsheet'
+
+# Or, if using git:
+ssh root@SERVER_IP 'cd /root/amo2gsheet && bash deploy/update.sh'
 ```
 
 ### Update .env settings
 
 ```bash
 nano /root/amo2gsheet/.env
-sudo systemctl restart amo2gsheet
+systemctl restart amo2gsheet
 ```
 
 ### Add new pipelines
 
-1. Run `python inspect_amo.py` to get the new pipeline/status names.
-2. Add entries to `PIPELINE_DISPLAY_MAP` and `STATUS_DISPLAY_MAP` in `sync_service.py`.
-3. Restart the service.
+New pipelines matching `PIPELINE_KEYWORD` are picked up **automatically** on service restart — no code changes needed. To customise display names, add them to `PIPELINE_DISPLAY_MAP_JSON` in `.env`:
+
+```ini
+PIPELINE_DISPLAY_MAP_JSON={"Sardor - Sotuv Bioflex": "Сардор"}
+```
+
+If a new pipeline uses a different trigger status name, add it to `TRIGGER_STATUS_NAMES`.
 
 ### Add new staff members
 
-```bash
-# Interactive
-python setup_sheet.py
-
-# Or edit the Staff tab directly in Google Sheets
-```
+Edit the **Staff** tab directly in Google Sheets — changes are picked up within `STAFF_CACHE_TTL_SEC` (default 5 min) without restarting.
 
 ### View live logs
 
 ```bash
-sudo journalctl -u amo2gsheet -f
+journalctl -u amo2gsheet -f                  # live stream
+tail -f /var/log/amo2gsheet/app.log          # log file
+journalctl -u amo2gsheet --since '1 hour ago' # last hour
 ```
 
 ### Useful commands quick reference
 
 | Task | Command |
 |---|---|
-| Start | `sudo systemctl start amo2gsheet` |
-| Stop | `sudo systemctl stop amo2gsheet` |
-| Restart | `sudo systemctl restart amo2gsheet` |
-| Status | `sudo systemctl status amo2gsheet` |
-| Live logs | `sudo journalctl -u amo2gsheet -f` |
+| Start | `systemctl start amo2gsheet` |
+| Stop | `systemctl stop amo2gsheet` |
+| Restart | `systemctl restart amo2gsheet` |
+| Status | `systemctl status amo2gsheet` |
+| Live logs | `journalctl -u amo2gsheet -f` |
+| Update code | `bash deploy/update.sh` |
 | Inspect AMO | `python inspect_amo.py --users --leads 3` |
 | Re-init sheet | `python setup_sheet.py --check` |
-| Import staff | `python setup_sheet.py --staff staff.csv` |
+| Pre-deploy check | `python prod_check.py` |
 
 ---
 
@@ -467,11 +479,21 @@ sudo journalctl -u amo2gsheet -f
 | File | Purpose |
 |---|---|
 | `sync_service.py` | Main FastAPI service — webhook handler + sheet sync worker |
+| `dashboard_router.py` | Staff KPI dashboard endpoint |
+| `env_loader.py` | DEV / PROD environment switching |
 | `inspect_amo.py` | AMO account inspector — run once per new environment |
 | `setup_sheet.py` | Google Sheet initialiser — run once per new environment |
+| `prod_check.py` | Pre-deploy readiness checker (no writes) |
 | `import_xlsx.py` | Bulk lead importer from Excel |
+| `deploy/deploy.sh` | Full server setup script |
+| `deploy/update.sh` | Pull latest code + restart |
+| `deploy/amo2gsheet.service` | systemd unit — auto-restart, boot-start |
+| `deploy/cloudflared.service` | systemd unit for Cloudflare Tunnel |
+| `deploy/amo2gsheet.logrotate` | Log rotation config |
 | `.env` | All configuration and secrets |
 | `.env.example` | Template — copy to `.env` and fill in |
-| `gsheet.json` | Google service account key (never commit) |
-| `.amo_tokens.json` | AMO access/refresh tokens (auto-generated, never commit) |
+| `prod_gsheet.json` | Google service account key, PROD (never commit) |
+| `dev_gsheet.json` | Google service account key, DEV (never commit) |
+| `.amo_tokens_prod.json` | AMO tokens, PROD (auto-generated, never commit) |
+| `.amo_tokens_dev.json` | AMO tokens, DEV (auto-generated, never commit) |
 | `.sync_state.json` | Tracks last-known sheet status per lead (auto-generated) |

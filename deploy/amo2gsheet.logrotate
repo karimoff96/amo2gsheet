@@ -1,0 +1,18 @@
+# Log rotation for amo2gsheet (journald logs exported to file)
+# Place this file at: /etc/logrotate.d/amo2gsheet
+#
+# To export journald logs to a file first, add to amo2gsheet.service:
+#   StandardOutput=append:/var/log/amo2gsheet/app.log
+#   StandardError=append:/var/log/amo2gsheet/app.log
+# Then create the directory:  mkdir -p /var/log/amo2gsheet
+
+/var/log/amo2gsheet/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

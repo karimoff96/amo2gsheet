@@ -1,0 +1,27 @@
+[Unit]
+Description=Cloudflare Tunnel (amo2gsheet)
+After=network-online.target
+Wants=network-online.target
+# Restart before the main service so the tunnel is up first
+Before=amo2gsheet.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token YOUR_TUNNEL_TOKEN_HERE
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+Environment=TUNNEL_ORIGIN_CERT=/root/.cloudflared/cert.pem
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudflared
+
+[Install]
+WantedBy=multi-user.target
