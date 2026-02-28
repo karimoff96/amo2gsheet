@@ -235,6 +235,54 @@ def setup_staff_sheet(spreadsheet, check_only: bool,
         info("No staff entries added.")
 
 
+def clean_empty_rows(spreadsheet, ws_name: str) -> None:
+    """Delete every fully-blank row (below the header) from ws_name."""
+    print(f"\n{SEP}")
+    print("  CLEAN EMPTY ROWS")
+    print(SEP)
+
+    try:
+        ws = spreadsheet.worksheet(ws_name)
+    except gspread.WorksheetNotFound:
+        warn(f"Worksheet '{ws_name}' not found.")
+        return
+
+    all_vals = ws.get_all_values()
+    # Collect 1-based row indices of completely empty rows, skipping header (row 1)
+    empty_rows = [
+        i + 1
+        for i, row in enumerate(all_vals)
+        if i > 0 and not any(str(cell).strip() for cell in row)
+    ]
+
+    if not empty_rows:
+        ok("No empty rows found — nothing to do.")
+        return
+
+    info(f"Found {len(empty_rows)} empty row(s). Deleting in reverse order…")
+
+    # Delete in reverse order so higher row numbers are removed first,
+    # which keeps lower indices stable.
+    # Batch consecutive rows into range calls to reduce API round-trips.
+    groups: list = []
+    start = empty_rows[-1]
+    end   = empty_rows[-1]
+    for r in reversed(empty_rows[:-1]):
+        if r == start - 1:
+            start = r
+        else:
+            groups.append((start, end))
+            start = end = r
+    groups.append((start, end))
+
+    deleted = 0
+    for s, e in groups:
+        ws.delete_rows(s, e)
+        deleted += e - s + 1
+
+    ok(f"Deleted {deleted} empty row(s) from '{ws_name}'.")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -246,6 +294,8 @@ def main():
                         help="Verify only — make no changes")
     parser.add_argument("--skip-staff", action="store_true",
                         help="Skip Staff sheet setup (use when it already exists)")
+    parser.add_argument("--clean-empty-rows", action="store_true",
+                        help="Delete all fully-blank rows from the main data sheet and exit")
     args = parser.parse_args()
 
     mode = "CHECK ONLY" if args.check else "SETUP"
@@ -264,6 +314,11 @@ def main():
         sys.exit(f"\n[ERROR] Could not open spreadsheet: {e}\n"
                  "Make sure the service account email is shared on the sheet "
                  "(Editor access).")
+
+    if args.clean_empty_rows:
+        clean_empty_rows(spreadsheet, WS_NAME)
+        print(f"\n{'='*60}\n  Done.\n{'='*60}\n")
+        return
 
     setup_main_sheet(spreadsheet, check_only=args.check)
     if not args.skip_staff:

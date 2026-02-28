@@ -611,11 +611,63 @@ class SheetSync:
     # Eliminates repeated get_all_values() calls.  Built once per worksheet on
     # first access; updated in O(1) whenever a row is appended or header reset.
 
+    def _purge_empty_rows(self, ws, ws_name: str, all_vals: List[Any]) -> List[Any]:
+        """Delete fully-blank rows (excluding header row 1) from *ws*.
+
+        Called once at cold-start from _build_row_index.  Returns the cleaned
+        list of rows so the caller can build the index without a second API fetch.
+        Consecutive empty rows are batched into a single delete_rows() call to
+        minimise API quota usage.  Deletion is done in reverse order so that
+        row indices above the deleted range remain stable throughout.
+        """
+        # Collect 1-based indices of empty data rows (skip index 0 = header)
+        empty: List[int] = [
+            i + 1
+            for i, row in enumerate(all_vals)
+            if i > 0 and not any(str(cell).strip() for cell in row)
+        ]
+        if not empty:
+            return all_vals
+
+        print(f"[INFO] '{ws_name}': found {len(empty)} empty row(s) — removing automatically.")
+
+        # Group consecutive indices so we can delete ranges in one call each
+        groups: List[tuple] = []
+        start = end = empty[-1]
+        for r in reversed(empty[:-1]):
+            if r == start - 1:
+                start = r
+            else:
+                groups.append((start, end))
+                start = end = r
+        groups.append((start, end))
+
+        deleted = 0
+        for s, e in groups:
+            ws.delete_rows(s, e)
+            deleted += e - s + 1
+            print(f"[INFO] '{ws_name}': deleted rows {s}–{e} ({e - s + 1} row(s)).")
+
+        print(f"[INFO] '{ws_name}': purged {deleted} empty row(s) successfully.")
+
+        # Return the cleaned data so _build_row_index doesn't need a second fetch
+        cleaned = [row for i, row in enumerate(all_vals)
+                   if i + 1 not in set(empty)]
+        return cleaned
+
     def _build_row_index(self, ws, ws_name: str) -> None:
-        """Read the sheet once and build lead_id → row_number mapping."""
+        """Read the sheet once, purge any empty rows, then build lead_id → row mapping."""
         all_vals = ws.get_all_values()
+
+        # Automatically remove empty rows left over from manual sheet clears.
+        # This runs exactly once per cold-start (or after index invalidation).
+        all_vals = self._purge_empty_rows(ws, ws_name, all_vals)
+
         idx: Dict[str, int] = {}
+        last_data_row = 0
         for i, row in enumerate(all_vals):
+            if any(str(cell).strip() for cell in row):
+                last_data_row = i + 1  # track last row with any content
             if i == 0:
                 continue  # skip header
             if len(row) > ID_COL_INDEX:
@@ -623,7 +675,10 @@ class SheetSync:
                 if lid:
                     idx[lid] = i + 1  # 1-based row number
         self._row_index[ws_name] = idx
-        self._row_count[ws_name] = len(all_vals)
+        # Use the last *non-empty* row so that blank rows left over from a
+        # manual sheet clear are not counted — new data will fill from
+        # directly after the last real row instead of after the blanks.
+        self._row_count[ws_name] = last_data_row
 
     def _get_row_index(self, ws, ws_name: str) -> Dict[str, int]:
         if ws_name not in self._row_index:
