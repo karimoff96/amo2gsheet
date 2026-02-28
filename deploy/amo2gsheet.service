@@ -5,17 +5,17 @@ After=network-online.target
 Wants=network-online.target
 # If cloudflared tunnel is used, wait for it too
 After=cloudflared.service
+# Rate-limit restarts: if it crashes more than 5 times in 60s, stop trying
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/amo2gsheet
 
-# Use the virtualenv Python directly
-ExecStart=/root/amo2gsheet/venv/bin/python -m uvicorn sync_service:app \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --no-access-log
+# Wrapper sources .env (supports comments) then starts uvicorn
+ExecStart=/bin/bash /root/amo2gsheet/deploy/start.sh
 
 # Restart policy — always restart, even on clean exit
 Restart=always
@@ -24,13 +24,6 @@ RestartSec=5
 TimeoutStartSec=30
 # Give it 10s to shut down gracefully before SIGKILL
 TimeoutStopSec=10
-
-# Rate-limit restarts: if it crashes more than 5 times in 60s, stop trying
-StartLimitIntervalSec=60
-StartLimitBurst=5
-
-# Load all variables from .env into the process environment
-EnvironmentFile=/root/amo2gsheet/.env
 
 # Environment
 Environment=PYTHONUNBUFFERED=1

@@ -73,6 +73,8 @@ echo "==> [6/7] Installing systemd services..."
 # Substitute the actual project path into the service file before installing
 sed "s|/root/amo2gsheet|$PROJECT_DIR|g" deploy/amo2gsheet.service \
     > /etc/systemd/system/amo2gsheet.service
+# Make the start wrapper executable
+chmod +x "$PROJECT_DIR/deploy/start.sh"
 
 # Only install cloudflared service if token is configured in it
 if grep -q "YOUR_TUNNEL_TOKEN_HERE" deploy/cloudflared.service; then
