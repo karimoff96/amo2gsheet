@@ -29,6 +29,9 @@ TimeoutStopSec=10
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
+# Load all variables from .env into the process environment
+EnvironmentFile=/root/amo2gsheet/.env
+
 # Environment
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
