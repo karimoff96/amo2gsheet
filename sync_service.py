@@ -161,7 +161,7 @@ class Config:
     INITIAL_SYNC_DATE_FROM = os.getenv("INITIAL_SYNC_DATE_FROM", "").strip()
     INITIAL_SYNC_DATE_TO   = os.getenv("INITIAL_SYNC_DATE_TO",   "").strip()
     # Minimum seconds between consecutive amoCRM API calls. Increase on prod if you see 429s.
-    AMO_REQUEST_DELAY_SEC = float(os.getenv("AMO_REQUEST_DELAY_SEC", "0.2"))
+    AMO_REQUEST_DELAY_SEC = float(os.getenv("AMO_REQUEST_DELAY_SEC", "0.08"))
     # How long (seconds) the Staff sheet mapping is cached before re-fetching.
     STAFF_CACHE_TTL_SEC = int(os.getenv("STAFF_CACHE_TTL_SEC", "300"))
     # If the same (lead_id, status_id) webhook arrives again within this window, skip it.
@@ -392,7 +392,6 @@ class AmoClient:
                 f"/api/v4/leads"
                 f"?filter[created_at][from]={ts_from}"
                 f"&filter[created_at][to]={ts_to}"
-                f"&with=contacts,companies"
                 f"&limit=250&page={page}"
             )
             try:
@@ -410,6 +409,65 @@ class AmoClient:
                 break
             page += 1
         return all_leads
+
+    def fetch_order_event_lead_ids(
+        self,
+        ts_from: int,
+        ts_to: int,
+        order_status_ids: set,
+        created_lead_ids: set | None = None,
+    ) -> set:
+        """Return the set of lead IDs that *first* entered an order stage in [ts_from, ts_to].
+
+        Only counts transitions FROM a non-order stage TO an order stage, so
+        internal hops like Заказ→В процессе→У курера are not double-counted.
+
+        If ``created_lead_ids`` is given, the result is further intersected with
+        that set — i.e. only leads that were also created in the same window count.
+        This matches the reference-sheet definition:
+            consul  = leads created on date
+            zakas   = leads created on date that became orders on that same date
+        """
+        events: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            endpoint = (
+                f"/api/v4/events"
+                f"?filter[type][]=lead_status_changed"
+                f"&filter[created_at][from]={ts_from}"
+                f"&filter[created_at][to]={ts_to}"
+                f"&limit=250&page={page}"
+            )
+            try:
+                data = self.get(endpoint)
+            except RuntimeError as exc:
+                if "204" in str(exc) or "No Content" in str(exc):
+                    break
+                raise
+            batch = (data.get("_embedded") or {}).get("events") or []
+            if not batch:
+                break
+            events.extend(batch)
+            if not (data.get("_links") or {}).get("next"):
+                break
+            page += 1
+
+        first_entry: Dict[int, int] = {}  # lead_id -> earliest event ts
+        for ev in events:
+            lead_id  = int(ev.get("entity_id", 0) or 0)
+            before   = (ev.get("value_before") or [{}])[0]
+            after    = (ev.get("value_after")  or [{}])[0]
+            old_sid  = int((before.get("lead_status") or {}).get("id", 0) or 0)
+            new_sid  = int((after.get("lead_status")  or {}).get("id", 0) or 0)
+            if new_sid in order_status_ids and old_sid not in order_status_ids:
+                ev_ts = int(ev.get("created_at", 0) or 0)
+                if lead_id not in first_entry or ev_ts < first_entry[lead_id]:
+                    first_entry[lead_id] = ev_ts
+
+        result = set(first_entry.keys())
+        if created_lead_ids is not None:
+            result &= created_lead_ids
+        return result
 
     def patch(self, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
         token = self.get_access_token()
@@ -1428,4 +1486,4 @@ if __name__ == "__main__":
 
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host=host, port=port, reload=False)
+    uvicorn.run("sync_service:app", host=host, port=port, reload=True)
