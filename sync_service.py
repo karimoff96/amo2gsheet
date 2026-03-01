@@ -3,7 +3,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -173,6 +173,9 @@ class Config:
     # Only process leads from pipelines whose name contains this keyword (case-insensitive).
     # New pipelines matching the keyword are picked up automatically. Empty = all pipelines.
     PIPELINE_KEYWORD = os.getenv("PIPELINE_KEYWORD", "").strip().lower()
+    # Hours offset from UTC used when formatting timestamps for display in the Sheet.
+    # Uzbekistan / Tashkent = 5 (UTC+5).  Set to 0 for UTC, 3 for Moscow, etc.
+    DISPLAY_TZ_OFFSET = float(os.getenv("DISPLAY_TZ_OFFSET", "5"))
 
 
 def require_env() -> None:
@@ -186,6 +189,25 @@ def require_env() -> None:
     missing = [k for k in required if not os.getenv(k)]
     if missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
+
+
+def _ts_to_date(ts, include_time: bool = False) -> str:
+    """Convert a Unix timestamp to a display string in the configured timezone.
+
+    Uses Config.DISPLAY_TZ_OFFSET (hours from UTC, default 5 = Tashkent/UTC+5).
+    Returns '' for falsy or zero values.
+    """
+    if not ts:
+        return ""
+    try:
+        ts_int = int(float(ts))
+        if ts_int == 0:
+            return ""
+        tz = timezone(timedelta(hours=Config.DISPLAY_TZ_OFFSET))
+        dt = datetime.fromtimestamp(ts_int, tz=tz)
+        return dt.strftime("%d.%m.%Y %H:%M") if include_time else dt.strftime("%d.%m.%Y")
+    except Exception:
+        return ""
 
 
 class TokenStore:
@@ -823,14 +845,11 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
                 # Convert Unix timestamps to human-readable dates
                 if norm_name in ("Дата заказа", "Дата доставка"):
                     try:
-                        # Use the first value for dates
                         first_val = values[0].get("value", "")
-                        if first_val == 0 or first_val == "0":
-                            val = ""
-                        elif isinstance(first_val, (int, float)):
-                            val = datetime.fromtimestamp(first_val).strftime("%d.%m.%Y")
-                        elif isinstance(first_val, str) and first_val.isdigit():
-                            val = datetime.fromtimestamp(int(first_val)).strftime("%d.%m.%Y")
+                        converted = _ts_to_date(first_val)
+                        # Only replace val if conversion succeeded; otherwise keep raw
+                        if converted or first_val in (0, "0", "", None):
+                            val = converted
                     except Exception:
                         pass  # Keep original value if conversion fails
                         
@@ -846,6 +865,12 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
                         
                     if clean_val in staff_mapping:
                         mapped["Ответственный"] = staff_mapping[clean_val]
+
+    # If "Дата заказа" was not filled in AmoCRM, fall back to the lead's own
+    # created_at timestamp (the moment the lead was created in AMO).
+    # This is shown with time since it is a precise creation moment.
+    if not mapped.get("Дата заказа"):
+        mapped["Дата заказа"] = _ts_to_date(lead.get("created_at"), include_time=True)
 
     # Re-apply pipeline-derived fields AFTER custom fields so AMO custom fields
     # named "Статус" or "Воронка" can never silently overwrite the correct values.
