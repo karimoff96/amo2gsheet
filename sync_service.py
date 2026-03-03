@@ -824,7 +824,7 @@ class SheetSync:
             # manual deletion).  This prevents gaps / empty rows from accumulating.
             result = ws.append_rows(
                 [row_data],
-                value_input_option="USER_ENTERED",
+                value_input_option="RAW",
                 insert_data_option="INSERT_ROWS",
             )
             # Parse the actual row number from the API response:
