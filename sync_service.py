@@ -818,6 +818,17 @@ class SheetSync:
                 ws.update(values=[row_data], range_name=f"A{row_num}")
                 return row_num
 
+            # Lead not found in cached index — the cache might be stale.
+            # Force a fresh rebuild from the actual sheet before concluding
+            # the lead is truly absent. This is the last line of defence
+            # against duplicate rows caused by any stale-cache scenario.
+            self._build_row_index(ws, ws_name)
+            row_idx = self._row_index[ws_name]
+            row_num = row_idx.get(lead_id)
+            if row_num:
+                ws.update(values=[row_data], range_name=f"A{row_num}")
+                return row_num
+
             # Use append_rows instead of a position-specific update so that the row
             # is always placed directly after the last real data row on the sheet,
             # regardless of whether _row_count is stale (e.g. after an external
@@ -1121,10 +1132,13 @@ class SyncService:
                     if _tn and _tn not in all_trigger_names:
                         all_trigger_names.append(_tn)
 
-                # Match trigger by raw name OR display name across ALL configured trigger names.
+                # Match trigger by raw AMO status name ONLY.
+                # Do NOT match by display name — "ЗАКАЗ БЕЗ НУМЕРАЦИИ" maps to display
+                # "В процессе", and matching by display would make every status that also
+                # displays as "В процессе" (e.g. a real "В процессе" operational stage)
+                # fire sheet-row creation, causing duplicate/unexpected leads.
                 for t_name in all_trigger_names:
-                    t_display = STATUS_DISPLAY_MAP.get(t_name, t_name)
-                    if status_name == t_name or display_name == t_display:
+                    if status_name == t_name:
                         self.trigger_status_ids.add(status_id)
                         break
 
