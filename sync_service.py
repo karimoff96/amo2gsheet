@@ -546,11 +546,32 @@ class SheetSync:
         self._sheets[name] = ws
         return ws
 
-    def _sheet_for_pipeline(self, pipeline_display: str):
-        """Return (and lazily create) the worksheet for a given pipeline display name."""
-        # All leads are recorded on one file, ignoring pipeline_display
-        tab = self.cfg.GOOGLE_WORKSHEET_NAME
-        return self._get_or_create_sheet(tab)
+    def _get_or_create_month_sheet(self, tab_name: str):
+        """Return (and lazily create) the worksheet for the given month tab.
+
+        Tab names are typically "MM.YYYY" (e.g. "03.2026").  The sheet is
+        created with column headers, a frozen header row, and a status-column
+        dropdown when it does not yet exist.
+        """
+        if tab_name in self._sheets:
+            return self._sheets[tab_name]
+        # Re-fetch spreadsheet metadata to avoid stale cache issues
+        self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+        try:
+            ws = self.spreadsheet.worksheet(tab_name)
+        except gspread.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(title=tab_name, rows=2000, cols=max(26, len(COLUMNS)))
+        # Ensure column headers are in place
+        first_row = ws.row_values(1)
+        if first_row != COLUMNS:
+            ws.update(values=[COLUMNS], range_name="A1")
+            ws.freeze(rows=1)
+            self._invalidate_row_index(tab_name)
+        # Apply dropdown validation to the entire status column (rows 2-2000)
+        status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+        self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
+        self._sheets[tab_name] = ws
+        return ws
 
     def rotate_to_archive(self, archive_tab_name: str) -> None:
         """Rename the current active worksheet to archive_tab_name, then create a
@@ -677,13 +698,56 @@ class SheetSync:
                    if i + 1 not in set(empty)]
         return cleaned
 
+    def _purge_duplicate_rows(self, ws, ws_name: str, all_vals: List[Any]) -> List[Any]:
+        """Delete rows where the same lead ID appears more than once, keeping the LAST
+        occurrence so the in-memory row index stays consistent with what we update later.
+
+        Called once at cold-start (or index rebuild) from _build_row_index, right after
+        _purge_empty_rows.  Deletions run in reverse row-number order to avoid index
+        shifting.  Returns the cleaned list of rows.
+        """
+        # Map lead_id → list of ALL 1-based row indices where it appears
+        occurrences: Dict[str, List[int]] = {}
+        for i, row in enumerate(all_vals):
+            if i == 0:
+                continue  # skip header
+            if len(row) > ID_COL_INDEX:
+                lid = str(row[ID_COL_INDEX]).strip()
+                if lid:
+                    occurrences.setdefault(lid, []).append(i + 1)  # 1-based index in all_vals
+
+        # Collect row indices to remove (all but the last occurrence per lead_id)
+        to_delete: set = set()
+        for lid, row_nums in occurrences.items():
+            if len(row_nums) > 1:
+                earlier = row_nums[:-1]
+                print(
+                    f"[INFO] '{ws_name}': lead {lid} has {len(row_nums)} duplicate rows "
+                    f"— removing earlier occurrence(s) at row(s) {earlier}, keeping row {row_nums[-1]}"
+                )
+                to_delete.update(earlier)
+
+        if not to_delete:
+            return all_vals
+
+        # Delete from highest row to lowest so that row indices below each deletion
+        # remain valid throughout the loop.
+        for row_num in sorted(to_delete, reverse=True):
+            ws.delete_rows(row_num)
+
+        print(f"[INFO] '{ws_name}': purged {len(to_delete)} duplicate lead row(s) successfully.")
+
+        # Return a cleaned list (keeps rows whose 1-based index is NOT in to_delete)
+        return [row for i, row in enumerate(all_vals) if (i + 1) not in to_delete]
+
     def _build_row_index(self, ws, ws_name: str) -> None:
-        """Read the sheet once, purge any empty rows, then build lead_id → row mapping."""
+        """Read the sheet once, purge empty + duplicate rows, then build lead_id → row mapping."""
         all_vals = ws.get_all_values()
 
-        # Automatically remove empty rows left over from manual sheet clears.
-        # This runs exactly once per cold-start (or after index invalidation).
+        # Remove blank rows left over from manual sheet clears.
         all_vals = self._purge_empty_rows(ws, ws_name, all_vals)
+        # Remove duplicate lead-ID rows (keep last occurrence per ID).
+        all_vals = self._purge_duplicate_rows(ws, ws_name, all_vals)
 
         idx: Dict[str, int] = {}
         last_data_row = 0
@@ -716,8 +780,8 @@ class SheetSync:
         """O(1) row lookup via in-memory index (cold start: one get_all_values())."""
         return self._get_row_index(ws, ws.title).get(str(lead_id))
 
-    def upsert_row(self, row_data: List[Any], pipeline_display: str = "") -> int:
-        ws = self._sheet_for_pipeline(pipeline_display)
+    def upsert_row(self, row_data: List[Any], tab_name: str) -> int:
+        ws = self._get_or_create_month_sheet(tab_name)
         lead_id = str(row_data[ID_COL_INDEX])
         ws_name = ws.title
         with self.lock:
@@ -727,19 +791,37 @@ class SheetSync:
                 ws.update(values=[row_data], range_name=f"A{row_num}")
                 return row_num
 
-            # Append after the last known row — no second get_all_values() needed
-            next_row = self._row_count.get(ws_name, 1) + 1
-            ws.update(values=[row_data], range_name=f"A{next_row}")
+            # Use append_rows instead of a position-specific update so that the row
+            # is always placed directly after the last real data row on the sheet,
+            # regardless of whether _row_count is stale (e.g. after an external
+            # manual deletion).  This prevents gaps / empty rows from accumulating.
+            result = ws.append_rows(
+                [row_data],
+                value_input_option="USER_ENTERED",
+                insert_data_option="INSERT_ROWS",
+            )
+            # Parse the actual row number from the API response:
+            # result["updates"]["updatedRange"] = "SheetName!A51:T51"
+            actual_row: int = self._row_count.get(ws_name, 1) + 1  # safe fallback
+            try:
+                updated_range = result.get("updates", {}).get("updatedRange", "")
+                # Extract the START row from a range like "Sheet1!A51:T51" or "A51:T51"
+                m = re.search(r"[A-Za-z](\d+):", updated_range)
+                if m:
+                    actual_row = int(m.group(1))
+            except Exception:
+                pass  # Keep fallback value
+
             # Keep index consistent
-            row_idx[lead_id] = next_row
-            self._row_count[ws_name] = next_row
+            row_idx[lead_id] = actual_row
+            self._row_count[ws_name] = actual_row
             # Apply a dropdown to the status cell of the new row
             status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-            self._apply_status_dropdown(ws, f"{status_col_letter}{next_row}:{status_col_letter}{next_row}")
-            return next_row
+            self._apply_status_dropdown(ws, f"{status_col_letter}{actual_row}:{status_col_letter}{actual_row}")
+            return actual_row
 
-    def update_status(self, lead_id: str, status_name: str, pipeline_display: str = "") -> None:
-        ws = self._sheet_for_pipeline(pipeline_display)
+    def update_status(self, lead_id: str, status_name: str, tab_name: str = "") -> None:
+        ws = self._get_or_create_month_sheet(tab_name or datetime.now().strftime("%m.%Y"))
         with self.lock:
             row_num = self.find_row(ws, lead_id)
             if not row_num:
@@ -748,21 +830,45 @@ class SheetSync:
             ws.update_cell(row_num, col, status_name)
 
     def iter_lead_statuses(self) -> List[Dict[str, str]]:
-        """Iterate statuses across the main worksheet."""
+        """Iterate statuses across ALL monthly worksheets.
+
+        Scans every tab whose name matches the "MM.YYYY" pattern plus the
+        legacy GOOGLE_WORKSHEET_NAME tab (for backward compat during migration).
+        Each returned dict includes a ``tab_name`` key so callers can record
+        which sheet each lead lives on.
+        """
         out: List[Dict[str, str]] = []
         try:
-            ws = self._get_or_create_sheet(self.cfg.GOOGLE_WORKSHEET_NAME)
-        except Exception:
+            self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+            all_titles = [ws.title for ws in self.spreadsheet.worksheets()]
+        except Exception as exc:
+            print(f"[WARN] iter_lead_statuses: could not list worksheets: {exc}")
             return out
-        
-        for row in self._all_rows(ws):
-            if len(row) <= max(ID_COL_INDEX, STATUS_COL_INDEX):
-                continue
-            lead_id = str(row[ID_COL_INDEX]).strip()
-            status = str(row[STATUS_COL_INDEX]).strip()
-            order_number = str(row[ORDER_NUM_COL_INDEX]).strip() if len(row) > ORDER_NUM_COL_INDEX else ""
-            if lead_id:
-                out.append({"lead_id": lead_id, "status": status, "order_number": order_number})
+
+        month_pattern = re.compile(r'^\d{2}\.\d{4}$')  # e.g. "03.2026"
+        tabs_to_scan = [
+            t for t in all_titles
+            if month_pattern.match(t) or t == self.cfg.GOOGLE_WORKSHEET_NAME
+        ]
+
+        for tab_name in tabs_to_scan:
+            try:
+                ws = self._get_or_create_month_sheet(tab_name)
+                for row in self._all_rows(ws):
+                    if len(row) <= max(ID_COL_INDEX, STATUS_COL_INDEX):
+                        continue
+                    lead_id = str(row[ID_COL_INDEX]).strip()
+                    status = str(row[STATUS_COL_INDEX]).strip()
+                    order_number = str(row[ORDER_NUM_COL_INDEX]).strip() if len(row) > ORDER_NUM_COL_INDEX else ""
+                    if lead_id:
+                        out.append({
+                            "lead_id": lead_id,
+                            "status": status,
+                            "order_number": order_number,
+                            "tab_name": tab_name,
+                        })
+            except Exception as exc:
+                print(f"[WARN] iter_lead_statuses: could not read tab '{tab_name}': {exc}")
         return out
 
 
@@ -1068,6 +1174,7 @@ class SyncService:
             self.state.get("sheet_status_by_lead",       {}).pop(lid, None)
             self.state.get("sheet_order_number_by_lead", {}).pop(lid, None)
             self.state.get("lead_expiry",                {}).pop(lid, None)
+            self.state.get("lead_tab_by_lead",           {}).pop(lid, None)
             self._state_dirty = True
 
     def expire_finished_leads(self) -> None:
@@ -1089,12 +1196,41 @@ class SyncService:
         if seconds is not None:
             self.remember_lead_expiry(lead_id, time.time() + seconds)
 
+    def _tab_for_lead(self, lead: Dict[str, Any]) -> str:  # noqa: ARG002
+        """Return the active worksheet name for new lead writes.
+
+        The current month's data always lives on GOOGLE_WORKSHEET_NAME ("Sheet1").
+        When the month rolls over that tab is renamed to "MM.YYYY" and a fresh
+        Sheet1 is created, so returning the configured name here is always correct
+        for new leads.
+        """
+        return self.cfg.GOOGLE_WORKSHEET_NAME
+
+    def remember_lead_tab(self, lead_id: str, tab_name: str) -> None:
+        """Store which monthly sheet tab this lead was written to."""
+        with self.state_lock:
+            self.state.setdefault("lead_tab_by_lead", {})[str(lead_id)] = tab_name
+            self._state_dirty = True
+
+    def get_lead_tab(self, lead_id: str) -> str:
+        """Return the tab name where this lead's row lives.
+
+        Falls back to GOOGLE_WORKSHEET_NAME (Sheet1) if not recorded — i.e. the
+        active sheet, which is always correct for leads written during the current
+        month before a rotation occurred.
+        """
+        tab = self.state.get("lead_tab_by_lead", {}).get(str(lead_id), "")
+        return tab if tab else self.cfg.GOOGLE_WORKSHEET_NAME
+
     def bootstrap_sheet_state(self) -> None:
         rows = self.sheet.iter_lead_statuses()
         for item in rows:
             self.remember_sheet_status(item["lead_id"], item["status"])
             # Snapshot the current order number so we can detect when it gets filled
             self.remember_sheet_order_number(item["lead_id"], item.get("order_number", ""))
+            # Record which tab each lead lives on (used by update_status routing)
+            if item.get("tab_name"):
+                self.remember_lead_tab(item["lead_id"], item["tab_name"])
         self.flush_state()  # Persist bootstrapped state in one write
 
     def initial_sync_leads(self, date_from: str, date_to: str) -> None:
@@ -1145,9 +1281,11 @@ class SyncService:
             responsible_id   = int(lead.get("responsible_user_id", 0) or 0)
             responsible_name = self.users_map.get(responsible_id, str(responsible_id))
 
+            tab_name = self._tab_for_lead(lead)
             row = build_row(lead, status_display, pipeline_name, responsible_name, staff_mapping)
-            self.sheet.upsert_row(row, pipeline_display)
+            self.sheet.upsert_row(row, tab_name)
             self.remember_sheet_status(lead_id, status_display)
+            self.remember_lead_tab(lead_id, tab_name)
             self.remember_sheet_order_number(lead_id, "")
             written += 1
 
@@ -1155,57 +1293,77 @@ class SyncService:
         print(f"[INFO] Initial sync complete: {written} written, {skipped} skipped.")
 
     def check_and_rotate_sheet(self) -> None:
-        """Archive the active worksheet when the configured interval rolls over.
+        """Archive the active worksheet when the month rolls over.
 
-        SHEET_ROTATION_INTERVAL controls the granularity:
-          - "monthly" (default): rotates on the 1st of each new month.
-                State key: YYYY-MM  →  archive tab name: MM.YYYY  (e.g. 02.2026)
-          - "hourly": rotates every new clock-hour (for testing purposes).
-                State key: YYYY-MM-DD-HH  →  archive tab name: DD.MM.YYYY HH:00
+        Sheet1 (GOOGLE_WORKSHEET_NAME) always holds the *current* month's data.
+        On the first call of a new month:
+          1. Sheet1 is renamed to "MM.YYYY" (e.g. "02.2026") — the archive tab.
+          2. A fresh Sheet1 is created for the new month.
+          3. Any lead whose tracked tab was "Sheet1" has its pointer updated to
+             the new archive name so future status updates still find the right row.
+
+        Safe to call every SYNC_POLL_SECONDS — exits in O(1) when nothing changed.
         """
-        now = datetime.now()
-        interval = self.cfg.SHEET_ROTATION_INTERVAL
-
-        if interval == "hourly":
-            current_key = now.strftime("%Y-%m-%d-%H")          # e.g. "2026-02-24-14"
-            def _archive_name(key: str) -> str:
-                return datetime.strptime(key, "%Y-%m-%d-%H").strftime("%d.%m.%Y %H:00")
-            label = "Hour"
-        else:
-            # Default: monthly
-            current_key = now.strftime("%Y-%m")                 # e.g. "2026-02"
-            def _archive_name(key: str) -> str:
-                return datetime.strptime(key, "%Y-%m").strftime("%m.%Y")
-            label = "Month"
+        tz = timezone(timedelta(hours=self.cfg.DISPLAY_TZ_OFFSET))
+        current_month = datetime.now(tz).strftime("%m.%Y")  # e.g. "03.2026"
 
         with self.state_lock:
             known_key = self.state.get("active_sheet_month", "")
 
-        if not known_key:
-            # First run — record current period, no rotation needed yet
-            with self.state_lock:
-                self.state["active_sheet_month"] = current_key
-            self._save_state()
-            print(f"[INFO] Sheet rotation initialised ({interval}): current period = '{current_key}'")
+        # Normalise legacy "YYYY-MM" key to "MM.YYYY"
+        if known_key and known_key != current_month:
+            try:
+                known_key = datetime.strptime(known_key, "%Y-%m").strftime("%m.%Y")
+            except ValueError:
+                pass  # already "MM.YYYY" or some other format
+
+        # Fast path: still in the same month
+        if known_key == current_month:
             return
 
-        if known_key == current_key:
-            return  # Still within the same period
+        main_name = self.cfg.GOOGLE_WORKSHEET_NAME
 
-        # Period has rolled over — archive the old sheet
-        try:
-            archive_name = _archive_name(known_key)
-        except ValueError:
-            archive_name = known_key  # Fallback: use raw key as tab name
+        if not known_key:
+            # First ever run — nothing to archive, just record the current month
+            # and ensure the active tab exists.
+            try:
+                self.sheet._get_or_create_month_sheet(main_name)
+            except Exception as exc:
+                print(f"[WARN] Could not ensure active tab '{main_name}': {exc}")
+            with self.state_lock:
+                self.state["active_sheet_month"] = current_month
+            self._save_state()
+            print(f"[INFO] Sheet rotation initialised: current month = '{current_month}'")
+            return
 
-        print(f"[INFO] {label} changed '{known_key}' → '{current_key}': archiving sheet as '{archive_name}'")
+        # Month has rolled over — archive Sheet1 under the old month's name
+        archive_name = known_key  # e.g. "02.2026"
+        print(f"[INFO] Month changed '{known_key}' → '{current_month}': "
+              f"archiving '{main_name}' as '{archive_name}'")
         try:
             self.sheet.rotate_to_archive(archive_name)
-            with self.state_lock:
-                self.state["active_sheet_month"] = current_key
-            self._save_state()
         except Exception as exc:
             print(f"[ERROR] Sheet rotation failed: {exc}")
+            return
+
+        # Update lead_tab_by_lead: every lead that was on "Sheet1" is now on the
+        # archive tab so status updates keep routing to the correct sheet.
+        with self.state_lock:
+            lead_tabs = self.state.get("lead_tab_by_lead", {})
+            updated = 0
+            for lid, tab in lead_tabs.items():
+                if tab == main_name:
+                    lead_tabs[lid] = archive_name
+                    updated += 1
+            if updated:
+                self._state_dirty = True
+        if updated:
+            print(f"[INFO] Updated tab pointer for {updated} lead(s): "
+                  f"'{main_name}' → '{archive_name}'")
+
+        with self.state_lock:
+            self.state["active_sheet_month"] = current_month
+        self._save_state()
 
     def _enrich_lead_contacts(self, lead: Dict[str, Any]) -> Dict[str, Any]:
         """Fetch full contact details (incl. phone) for each contact embedded in lead."""
@@ -1299,11 +1457,16 @@ class SyncService:
                 
                 current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
                 
+                tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
-                self.sheet.upsert_row(row, pipeline_display)
+                self.sheet.upsert_row(row, tab_name)
                 self.remember_sheet_status(lead_id, current_status_name)
-                # Lead arrives without Заказ №; record empty so we can detect when admin fills it
-                self.remember_sheet_order_number(lead_id, "")
+                self.remember_lead_tab(lead_id, tab_name)
+                # Preserve any Заказ № already stored in AMO so that if a lead returns
+                # to the trigger status after the order number was filled, we do NOT
+                # reset known_order to "" and accidentally re-trigger the Заказ № push.
+                actual_order_num = str(row[ORDER_NUM_COL_INDEX]) if len(row) > ORDER_NUM_COL_INDEX else ""
+                self.remember_sheet_order_number(lead_id, actual_order_num)
                 written += 1
                 continue
 
@@ -1320,23 +1483,20 @@ class SyncService:
                 if sheet_display == "У курера" and known_status == "В процессе":
                     skipped_status_mismatch += 1
                     continue
-                self.sheet.update_status(lead_id, sheet_display, p_display)
+                self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                 self.remember_sheet_status(lead_id, sheet_display)
                 self._set_expiry_for_status(lead_id, sheet_display)
                 written += 1
             else:
                 if known_status:
                     new_status_display = self.status_id_to_display_name.get(status_id, str(status_id))
-                    lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
-                    p_name = self.pipeline_id_to_name.get(lead_pipeline_id, "")
-                    p_display = PIPELINE_DISPLAY_MAP.get(p_name, p_name)
                     # Apply sheet override: e.g. AMO "Раздумье" → sheet "Отказ"
                     sheet_display = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
                     # Same suppression: Заказ отправлен webhook must not overwrite "В процессе"
                     if sheet_display == "У курера" and known_status == "В процессе":
                         skipped_status_mismatch += 1
                         continue
-                    self.sheet.update_status(lead_id, sheet_display, p_display)
+                    self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                     self.remember_sheet_status(lead_id, sheet_display)
                     self._set_expiry_for_status(lead_id, sheet_display)
                     written += 1
@@ -1368,13 +1528,17 @@ class SyncService:
 
             # ── Order-number trigger: Заказ № filled by admin → move to Заказ отправлен ──
             known_order = self.get_known_order_number(lead_id)
-            # Only act if:
-            #  • we have previously tracked this lead (known_order is not None sentinel),
-            #  • the order number was empty before, and
-            #  • it is now non-empty.
-            # Use a sentinel of None (key absent) to mean "never tracked" vs. "" (empty).
+            # Only act if ALL of:
+            #  • we have previously tracked this lead (key present in state),
+            #  • the order number was empty before (known_order is ""),
+            #  • it is now non-empty in the sheet,
+            #  • the lead is still in "В процессе" — the stage where admin writes the
+            #    order number.  If the lead is already at Отказ, Успешно, or У курера
+            #    (came from a backward/forward AMO move), do NOT re-trigger this push.
+            #    This prevents an infinite loop when a lead with a filled Заказ №
+            #    is manually moved back to the trigger status by a manager.
             order_was_tracked = str(lead_id) in self.state.get("sheet_order_number_by_lead", {})
-            if order_was_tracked and not known_order and order_number:
+            if order_was_tracked and not known_order and order_number and status_name == "В процессе":
                 try:
                     lead = self.amo.get(f"/api/v4/leads/{lead_id}")
                     lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
