@@ -16,8 +16,7 @@ import json
 import os
 import secrets
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Form, Query, Request
@@ -224,100 +223,31 @@ def create_dashboard_router(service) -> APIRouter:
             if not sotuv_pipeline_ids:
                 sotuv_pipeline_ids = set(service.pipeline_id_to_name.keys())
 
-            # ── 1c. Build ORDER_SIDS: status IDs = order stages in sotuv pipelines
-            order_status_ids: set[int] = {
-                sid
-                for pid in sotuv_pipeline_ids
-                for dname, sid in (service.pipeline_status_display_to_id or {}).get(pid, {}).items()
-                if dname in ZAKAS_DISPLAY_NAMES
-            }
-
-            # ── 2. Fetch leads + events in PARALLEL to minimise wall-clock time ──
-            try:
-                ts_from = int(datetime.strptime(date_from, "%Y-%m-%d").timestamp())
-                ts_to   = int(datetime.strptime(date_to,   "%Y-%m-%d").timestamp()) + 86399
-            except ValueError:
-                ts_from = ts_to = 0
-
+            # ── 1c. Fetch leads for Приемщик table (live AMO query) ──────────
+            # Staff KPI data now comes from the local SQLite store (event-driven).
+            # Only the Приемщик table is still sourced from live AMO leads.
             leads: List[Dict] = []
-            raw_event_ids: set[int] = set()  # from events API (before created-filter)
-            events_loaded = False
-
-            def _fetch_leads():
-                return service.amo.fetch_leads_by_date_range(date_from, date_to)
-
-            def _fetch_events():
-                if not (ts_from and order_status_ids):
-                    return set()
-                # Fetch without created_lead_ids; we'll intersect after leads return.
-                return service.amo.fetch_order_event_lead_ids(
-                    ts_from=ts_from,
-                    ts_to=ts_to,
-                    order_status_ids=order_status_ids,
-                    created_lead_ids=None,
-                )
-
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_leads  = pool.submit(_fetch_leads)
-                fut_events = pool.submit(_fetch_events)
-                try:
-                    leads = fut_leads.result()
-                except Exception as exc:
-                    print(f"[DASHBOARD] Leads fetch failed: {exc}")
-                    leads = []
-                try:
-                    raw_event_ids = fut_events.result()
-                    events_loaded = True
-                except Exception as exc:
-                    print(f"[DASHBOARD] Events fetch failed, falling back to status check: {exc}")
+            try:
+                leads = service.amo.fetch_leads_by_date_range(date_from, date_to)
+            except Exception as exc:
+                print(f"[DASHBOARD] Leads fetch failed (Приемщик): {exc}")
 
             # Cache raw leads for the export endpoint (same TTL as stats)
             _leads_cache[cache_key] = {"ts": time.monotonic(), "leads": leads}
 
-            # Intersect events with leads created in the same window (sotuv only)
-            created_lead_ids: set[int] = {
-                int(lead["id"])
-                for lead in leads
-                if int(lead.get("pipeline_id", 0) or 0) in sotuv_pipeline_ids
-            }
-            ordered_today_ids: set[int] = raw_event_ids & created_lead_ids if events_loaded else set()
-
-            # ── 3. Aggregate per-staff AND per-Приемщик ───────────────────────
-            user_stats: Dict[str, Dict] = {}
+            # ── 2. Приемщик aggregation (live AMO data — unchanged) ───────────
             priemshchik_stats: Dict[str, Dict] = {}
-            skipped_unknown = 0  # leads whose code isn't in the Staff sheet
-
             for lead in leads:
-                # ── pipeline filter: only sotuv leads ─────────────────────────
                 lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
                 if sotuv_pipeline_ids and lead_pipeline_id not in sotuv_pipeline_ids:
                     continue
-
                 status_id      = int(lead.get("status_id", 0) or 0)
                 status_display = service.status_id_to_display_name.get(status_id, "")
                 budget         = float(lead.get("price", 0) or 0)
-                lead_id        = int(lead.get("id", 0) or 0)
-                # zakas = lead entered order stage on the same date it was created.
-                # Uses Events API for accuracy; falls back to current status if events unavailable.
-                if events_loaded:
-                    is_zakas = lead_id in ordered_today_ids
-                else:
-                    is_zakas = status_display in ZAKAS_DISPLAY_NAMES
+                is_zakas       = status_display in ZAKAS_DISPLAY_NAMES
                 is_otkaz       = status_display in OTKAZ_DISPLAY_NAMES
                 is_dumka       = status_display in DUMKA_DISPLAY_NAMES
                 cf_values      = lead.get("custom_fields_values") or []
-
-                # ── Extract "Группа" custom field (fallback group source) ─────
-                lead_group_override = ""
-                for cf in cf_values:
-                    fname = " ".join((cf.get("field_name") or "").split())
-                    if fname == "Группа":
-                        vals = cf.get("values") or []
-                        if vals:
-                            lead_group_override = str(vals[0].get("value", "")).strip()
-                        break
-
-                # ── 3a. Приемщик aggregation (runs for ALL leads) ─────────────
                 for cf in cf_values:
                     fname = " ".join((cf.get("field_name") or "").split())
                     if fname in ("Приемщик", "Приёмщик"):
@@ -327,12 +257,8 @@ def create_dashboard_router(service) -> APIRouter:
                             if p_name:
                                 if p_name not in priemshchik_stats:
                                     priemshchik_stats[p_name] = {
-                                        "name":   p_name,
-                                        "consul": 0,
-                                        "zakas":  0,
-                                        "otkaz":  0,
-                                        "dumka":  0,
-                                        "summa":  0.0,
+                                        "name": p_name, "consul": 0, "zakas": 0,
+                                        "otkaz": 0, "dumka": 0, "summa": 0.0,
                                     }
                                 priemshchik_stats[p_name]["consul"] += 1
                                 if is_zakas:
@@ -344,66 +270,42 @@ def create_dashboard_router(service) -> APIRouter:
                                     priemshchik_stats[p_name]["dumka"] += 1
                         break
 
-                # ── 3b. Staff aggregation (only leads with valid Код сотрудника) ─
-                raw_code = ""
-                for cf in cf_values:
-                    fname = " ".join((cf.get("field_name") or "").split())
-                    if fname == "Код сотрудника":
-                        vals = cf.get("values") or []
-                        if vals:
-                            raw_code = str(vals[0].get("value", "")).strip()
-                        break
-
-                if not raw_code:
-                    continue
-
-                # Skip non-numeric codes (garbage / test data)
-                try:
-                    norm_code = str(int(raw_code))
-                except ValueError:
-                    skipped_unknown += 1
-                    continue
-
-                # Skip codes not in the Staff sheet
-                staff_info = staff_by_code.get(norm_code) or staff_by_code.get(raw_code)
+            # ── 3. Staff stats from KPI SQLite store (event-driven, accurate) ──
+            # Events are recorded on the date they HAPPENED, so:
+            #   consul → date the lead entered КОНСУЛЬТАЦИЯ (= Лид for that staff)
+            #   zakas  → date the ЗАКАЗ transition occurred  (may be a later day)
+            #   dumka  → date the ДУМКА transition occurred
+            # ДУМКА recovery within 5 days is credited on the recovery date, NOT
+            # the original consul date — matching the business salary calculation.
+            kpi_rows = service.kpi_store.get_staff_stats(date_from, date_to)
+            user_stats: Dict[str, Dict] = {}
+            skipped_unknown = 0
+            for kpi in kpi_rows:
+                code = str(kpi["staff_code"]).strip()
+                staff_info = (
+                    staff_by_code.get(code)
+                    or staff_by_code.get(code.lstrip("0"))
+                    or staff_by_code.get(code.zfill(4))
+                )
                 if not staff_info:
                     skipped_unknown += 1
                     continue
-
-                # Use dept from Staff sheet; fall back to lead's "Группа" custom field
-                dept         = staff_info["group"] or lead_group_override
-                display_name = staff_info["full_name"]
-
-                if norm_code not in user_stats:
-                    user_stats[norm_code] = {
-                        "code":   norm_code,
-                        "name":   display_name,
-                        "group":  dept,
-                        "consul": 0,
-                        "zakas":  0,
-                        "otkaz":  0,
-                        "dumka":  0,
-                        "summa":  0.0,
-                    }
-                # If same staff, update group if blank (later Группа field may fill it)
-                elif not user_stats[norm_code]["group"] and dept:
-                    user_stats[norm_code]["group"] = dept
-
-                user_stats[norm_code]["consul"] += 1
-                if is_zakas:
-                    user_stats[norm_code]["zakas"] += 1
-                    user_stats[norm_code]["summa"] += budget
-                if is_otkaz:
-                    user_stats[norm_code]["otkaz"] += 1
-                if is_dumka:
-                    user_stats[norm_code]["dumka"] += 1
+                user_stats[code] = {
+                    "code":   code,
+                    "name":   staff_info["full_name"],
+                    "group":  staff_info["group"],
+                    "consul": int(kpi["consul"]),
+                    "zakas":  int(kpi["zakas"]),
+                    "otkaz":  0,
+                    "dumka":  int(kpi["dumka"]),
+                    "summa":  float(kpi["summa"]),
+                }
 
             # ── 4. Build staff rows with conversion ────────────────────────────
             rows_out: List[Dict] = []
             for st in user_stats.values():
                 consul = st["consul"]
                 zakas  = st["zakas"]
-                otkaz  = st["otkaz"]
                 dumka  = st["dumka"]
                 conv   = round(zakas / consul * 100, 1) if consul else 0.0
                 rows_out.append({
@@ -412,7 +314,7 @@ def create_dashboard_router(service) -> APIRouter:
                     "group":      st["group"],
                     "summa":      int(st["summa"]),
                     "zakas":      zakas,
-                    "otkaz":      otkaz,
+                    "otkaz":      0,
                     "dumka":      dumka,
                     "consul":     consul,
                     "conversion": conv,
@@ -482,6 +384,146 @@ def create_dashboard_router(service) -> APIRouter:
         except Exception as exc:
             print(f"[DASHBOARD] Error in stats endpoint: {traceback.format_exc()}")
             return {**_empty, "error": str(exc), "date_from": date_from, "date_to": date_to}
+
+    # ── Monthly report endpoint ───────────────────────────────────────────────
+    @router.get("/api/dashboard/monthly-report", tags=["dashboard"])
+    def monthly_report(
+        request: Request,
+        month:   str = Query(default="", description="YYYY-MM, defaults to current month"),
+        group:   str = Query(default="", description="Group filter: A / B / C / D"),
+    ) -> Dict[str, Any]:
+        """Return per-staff KPI aggregation for an entire month.
+
+        Because data is stored event-by-event in SQLite, this endpoint is
+        fast and does not require any AMO API calls.
+
+        Returns the same structure as /api/dashboard/stats plus a daily breakdown
+        suitable for building monthly salary reports.
+        """
+        import traceback
+        try:
+            if not month:
+                from datetime import date as _date
+                month = _date.today().strftime("%Y-%m")
+
+            # Resolve full month date range
+            from datetime import date as _date
+            y, m = int(month[:4]), int(month[5:7])
+            date_from = f"{month}-01"
+            if m == 12:
+                last_day = _date(y + 1, 1, 1) - timedelta(days=1)
+            else:
+                last_day = _date(y, m + 1, 1) - timedelta(days=1)
+            date_to = last_day.strftime("%Y-%m-%d")
+
+            # ── Load staff for name/group resolution ─────────────────────────
+            staff_by_code: Dict[str, Dict] = {}
+            now_ts = time.monotonic()
+            if _staff_cache["data"] is not None and (now_ts - _staff_cache["ts"]) < _STAFF_CACHE_TTL:
+                staff_by_code = _staff_cache["data"]
+            else:
+                try:
+                    ws = service.sheet._get_or_create_sheet("Staff")
+                    rows = ws.get_all_values()
+                    for row in rows[1:]:
+                        if len(row) < 3:
+                            continue
+                        code      = str(row[1]).strip()
+                        full_name = str(row[2]).strip()
+                        dept      = str(row[3]).strip() if len(row) >= 4 else ""
+                        if not full_name or not code:
+                            continue
+                        info = {"code": code, "group": dept, "full_name": full_name}
+                        staff_by_code[code] = info
+                        try:
+                            staff_by_code[str(int(code))] = info
+                        except ValueError:
+                            pass
+                    _staff_cache["data"] = staff_by_code
+                    _staff_cache["ts"]   = now_ts
+                except Exception as exc:
+                    print(f"[DASHBOARD] Could not load Staff sheet: {exc}")
+                    if _staff_cache["data"] is not None:
+                        staff_by_code = _staff_cache["data"]
+
+            # ── Monthly totals from KPI store ────────────────────────────────
+            kpi_rows = service.kpi_store.get_staff_stats(date_from, date_to)
+
+            # ── Daily breakdown ───────────────────────────────────────────────
+            daily_rows = service.kpi_store.get_daily_breakdown(date_from, date_to)
+            # daily_map: staff_code → {date → {consul, zakas, dumka, summa}}
+            daily_map: Dict[str, Dict] = {}
+            for dr in daily_rows:
+                code = str(dr["staff_code"])
+                d    = dr["event_date"]
+                daily_map.setdefault(code, {})[d] = {
+                    "consul": int(dr["consul"]),
+                    "zakas":  int(dr["zakas"]),
+                    "dumka":  int(dr["dumka"]),
+                    "summa":  float(dr["summa"]),
+                }
+
+            # ── Build output rows ─────────────────────────────────────────────
+            rows_out: List[Dict] = []
+            for kpi in kpi_rows:
+                code = str(kpi["staff_code"]).strip()
+                staff_info = (
+                    staff_by_code.get(code)
+                    or staff_by_code.get(code.lstrip("0"))
+                    or staff_by_code.get(code.zfill(4))
+                )
+                if not staff_info:
+                    continue
+                dept = staff_info["group"]
+                if group and dept.upper() != group.upper():
+                    continue
+                consul = int(kpi["consul"])
+                zakas  = int(kpi["zakas"])
+                dumka  = int(kpi["dumka"])
+                summa  = float(kpi["summa"])
+                conv   = round(zakas / consul * 100, 1) if consul else 0.0
+                rows_out.append({
+                    "code":       code,
+                    "name":       staff_info["full_name"],
+                    "group":      dept,
+                    "consul":     consul,
+                    "zakas":      zakas,
+                    "dumka":      dumka,
+                    "summa":      int(summa),
+                    "conversion": conv,
+                    "daily":      daily_map.get(code, {}),
+                })
+
+            rows_out.sort(key=lambda x: (-x["summa"], x["name"]))
+            for i, r in enumerate(rows_out, 1):
+                r["num"] = i
+
+            groups_out: Dict[str, List] = {}
+            for r in rows_out:
+                g = r["group"] or "—"
+                groups_out.setdefault(g, []).append(r)
+
+            all_consul = sum(r["consul"] for r in rows_out)
+            all_zakas  = sum(r["zakas"]  for r in rows_out)
+            all_dumka  = sum(r["dumka"]  for r in rows_out)
+            all_summa  = sum(r["summa"]  for r in rows_out)
+            avg_conv   = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
+
+            return {
+                "month":          month,
+                "date_from":      date_from,
+                "date_to":        date_to,
+                "total_consul":   all_consul,
+                "total_zakas":    all_zakas,
+                "total_dumka":    all_dumka,
+                "total_summa":    all_summa,
+                "avg_conversion": avg_conv,
+                "groups":         groups_out,
+            }
+
+        except Exception as exc:
+            print(f"[DASHBOARD] monthly-report error: {traceback.format_exc()}")
+            return {"error": str(exc), "month": month}
 
     # ── XLSX Export endpoint ──────────────────────────────────────────────────
     @router.get("/api/dashboard/export", tags=["dashboard"])

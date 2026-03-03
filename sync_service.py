@@ -13,6 +13,7 @@ from env_loader import load_env
 from fastapi import FastAPI, Request
 from gspread.utils import ValidationConditionType
 from dashboard_router import create_dashboard_router
+from kpi_store import KPIStore
 
 load_env()
 
@@ -103,6 +104,32 @@ SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
 AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
     "Раздумье": "Отказ",
 }
+
+# ── KPI status groupings (used by KPI store event recording) ─────────────────
+# Consul: the lead enters the consultation step — this is the "Лид" credit.
+KPI_CONSUL_DISPLAY_NAMES: set[str] = {"Консультация"}
+# Zakas: the lead reaches any confirmed-order stage.
+KPI_ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ", "В процессе", "У курера", "Успешно"}
+# Dumka: the lead is in a "thinking / hesitating" state.
+KPI_DUMKA_DISPLAY_NAMES: set[str] = {"Раздумье"}
+
+
+def _extract_staff_code(lead: Dict[str, Any]) -> str:
+    """Extract and normalise Код сотрудника from a lead's custom fields.
+
+    Returns the integer-normalised code string (e.g. '134') or '' if absent.
+    """
+    for cf in (lead.get("custom_fields_values") or []):
+        fname = " ".join((cf.get("field_name") or "").split())
+        if fname == "Код сотрудника":
+            vals = cf.get("values") or []
+            if vals:
+                raw = str(vals[0].get("value", "")).strip()
+                try:
+                    return str(int(raw))
+                except ValueError:
+                    return ""
+    return ""
 
 
 def _parse_leads_created_after(raw: str) -> int:
@@ -1010,6 +1037,14 @@ class SyncService:
         self._load_structure_mappings()
         self._load_users()
         self._print_config_warnings()
+        # ── KPI event store ──────────────────────────────────────────────────
+        _kpi_db = os.getenv("KPI_DB_PATH", "./data/kpi_events.db")
+        self.kpi_store = KPIStore(
+            db_path=_kpi_db,
+            tz_offset=self.cfg.DISPLAY_TZ_OFFSET,
+            dumka_recovery_days=int(os.getenv("DUMKA_RECOVERY_DAYS", "5")),
+        )
+        print(f"[KPI] Store initialised at {_kpi_db}")
 
     def _is_duplicate_webhook(self, lead_id: str, status_id: int) -> bool:
         """Return True if this (lead_id, status_id) was already processed within WEBHOOK_DEDUP_TTL_SEC.
@@ -1383,6 +1418,91 @@ class SyncService:
             lead.setdefault("_embedded", {})["contacts"] = enriched
         return lead
 
+    def _record_kpi_event(
+        self, full_lead: Dict[str, Any], webhook_status_id: int
+    ) -> None:
+        """Record a KPI event (consul/zakas/dumka) based on the webhook transition.
+
+        Uses webhook_status_id so we capture the transition that *happened*,
+        even if the lead has since moved to a different status in AMO.
+        """
+        display_name = self.status_id_to_display_name.get(webhook_status_id, "")
+        if not display_name:
+            return
+
+        lead_id = str(full_lead.get("id", "")).strip()
+        if not lead_id:
+            return
+
+        pipeline_id   = int(full_lead.get("pipeline_id", 0) or 0)
+        pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
+        budget        = float(full_lead.get("price", 0) or 0)
+
+        # Pipeline keyword filter: only record KPI for sotuv-type pipelines
+        if self.cfg.PIPELINE_KEYWORD:
+            if self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
+                return
+
+        try:
+            if display_name in KPI_CONSUL_DISPLAY_NAMES:
+                staff_code = _extract_staff_code(full_lead)
+                if staff_code:
+                    ok = self.kpi_store.record_consul(
+                        lead_id, staff_code, None, pipeline_name, budget
+                    )
+                    if ok:
+                        print(f"[KPI] consul  lead={lead_id} staff={staff_code}")
+
+            elif display_name in KPI_ZAKAS_DISPLAY_NAMES:
+                ok = self.kpi_store.record_zakas(lead_id, None, budget, pipeline_name)
+                if ok:
+                    print(f"[KPI] zakas   lead={lead_id}")
+
+            elif display_name in KPI_DUMKA_DISPLAY_NAMES:
+                ok = self.kpi_store.record_dumka(lead_id, None, pipeline_name)
+                if ok:
+                    print(f"[KPI] dumka   lead={lead_id}")
+
+        except Exception as exc:
+            print(f"[KPI] Error recording event for lead {lead_id}: {exc}")
+
+    def run_kpi_backfill(self, date_from: str, date_to: str) -> Dict[str, int]:
+        """Replay AMO events for the given date range and populate the KPI store."""
+        pipeline_keyword = getattr(self.cfg, "PIPELINE_KEYWORD", "").lower()
+        sotuv_pipeline_ids: set[int] = set()
+        if pipeline_keyword:
+            for pid, pname in self.pipeline_id_to_name.items():
+                if pipeline_keyword in pname.lower():
+                    sotuv_pipeline_ids.add(pid)
+
+        all_pipeline_ids = set(self.pipeline_id_to_name.keys())
+        scope = sotuv_pipeline_ids or all_pipeline_ids
+
+        consul_status_ids = set(self.trigger_status_ids)  # КОНСУЛЬТАЦИЯ IDs
+
+        zakas_status_ids: set[int] = {
+            sid
+            for pid in scope
+            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
+            if dname in KPI_ZAKAS_DISPLAY_NAMES
+        }
+        dumka_status_ids: set[int] = {
+            sid
+            for pid in scope
+            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
+            if dname in KPI_DUMKA_DISPLAY_NAMES
+        }
+
+        return self.kpi_store.backfill_from_amo(
+            amo=self.amo,
+            date_from=date_from,
+            date_to=date_to,
+            consul_status_ids=consul_status_ids,
+            zakas_status_ids=zakas_status_ids,
+            dumka_status_ids=dumka_status_ids,
+            sotuv_pipeline_ids=sotuv_pipeline_ids,
+        )
+
     def process_webhook_leads(self, leads: List[Dict[str, Any]]) -> Dict[str, Any]:
         written = 0
         trigger_matches = 0
@@ -1391,6 +1511,7 @@ class SyncService:
         skipped_duplicate = 0
         skipped_status_mismatch = 0
         skipped_too_old = 0
+        skipped_pipeline_kw = 0
         seen_status_ids: List[int] = []
 
         staff_mapping = self.sheet.get_staff_mapping()
@@ -1431,6 +1552,11 @@ class SyncService:
                 full_lead = lead
                 status_id = webhook_status_id
 
+            # ── KPI recording: record the transition indicated by the webhook ─
+            # Uses webhook_status_id (the event that triggered the webhook) so
+            # that we capture the transition that HAPPENED, not the current state.
+            self._record_kpi_event(full_lead, webhook_status_id)
+
             # Skip leads last updated before the configured cutoff (ignores stale history)
             if self.cfg.LEADS_CREATED_AFTER:
                 updated_at = int(full_lead.get("updated_at", 0) or 0)
@@ -1443,19 +1569,35 @@ class SyncService:
                 wh_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 wh_pipeline_name = self.pipeline_id_to_name.get(wh_pipeline_id, "")
                 if self.cfg.PIPELINE_KEYWORD not in wh_pipeline_name.lower():
+                    skipped_pipeline_kw += 1
+                    print(
+                        f"[SKIP] lead {lead_id}: pipeline '{wh_pipeline_name}' "
+                        f"does not match PIPELINE_KEYWORD='{self.cfg.PIPELINE_KEYWORD}'"
+                    )
                     continue
 
-            if status_id in self.trigger_status_ids:
+            # If the webhook fired for a trigger status but the re-fetched lead is
+            # already on a different status (race condition / manager moved it quickly),
+            # use the webhook status to decide what to write rather than silently dropping.
+            effective_status_id = status_id
+            if is_trigger and status_id not in self.trigger_status_ids:
+                print(
+                    f"[INFO] lead {lead_id}: webhook trigger status {webhook_status_id} but "
+                    f"re-fetched status is {status_id} — using webhook status to create row"
+                )
+                effective_status_id = webhook_status_id
+
+            if effective_status_id in self.trigger_status_ids:
                 trigger_matches += 1
                 trigger_display = STATUS_DISPLAY_MAP.get(self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME)
                 pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
                 pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
-                
+
                 responsible_id = int(full_lead.get("responsible_user_id", 0) or 0)
                 responsible_name = self.users_map.get(responsible_id, str(responsible_id))
-                
-                current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
+
+                current_status_name = self.status_id_to_display_name.get(effective_status_id, trigger_display)
                 
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
@@ -1470,7 +1612,7 @@ class SyncService:
                 written += 1
                 continue
 
-            terminal_name = self.terminal_status_id_to_name.get(str(status_id))
+            terminal_name = self.terminal_status_id_to_name.get(str(effective_status_id))
             if terminal_name:
                 terminal_matches += 1
                 lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
@@ -1517,6 +1659,7 @@ class SyncService:
             "seen_status_ids": sorted(list(set(seen_status_ids))),
             "resolved_trigger_status_ids": sorted(self.trigger_status_ids),
             "configured_terminal_status_ids": self.cfg.STATUS_MAP,
+            "skipped_pipeline_keyword": skipped_pipeline_kw,
         }
 
     def sync_sheet_to_amo(self) -> None:
@@ -1664,15 +1807,103 @@ def on_startup() -> None:
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
+    # ── KPI backfill (runs in background so startup is not blocked) ─────────
+    kpi_backfill_date = os.getenv("KPI_BACKFILL_DATE", "").strip()
+    if kpi_backfill_date and not service.kpi_store.is_backfill_done(kpi_backfill_date):
+        def _run_backfill():
+            try:
+                from datetime import date as _date
+                today_str = _date.today().strftime("%Y-%m-%d")
+                print(f"[KPI] Starting backfill {kpi_backfill_date} → {today_str} …")
+                counts = service.run_kpi_backfill(kpi_backfill_date, today_str)
+                service.kpi_store.mark_backfill_done(kpi_backfill_date, today_str)
+                print(f"[KPI] Backfill complete: {counts}")
+            except Exception as _exc:
+                print(f"[ERROR] KPI backfill failed: {_exc}")
+        threading.Thread(target=_run_backfill, daemon=True).start()
+
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok"}
 
 
+@app.post("/api/kpi/backfill")
+async def kpi_backfill_endpoint(request: Request) -> Dict[str, Any]:
+    """Manually trigger a KPI back-fill for a date range.
+
+    Body JSON: {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}
+    Runs synchronously; may take a while for large date ranges.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from datetime import date as _date
+    date_from = (payload.get("date_from") or "").strip()
+    date_to   = (payload.get("date_to")   or _date.today().strftime("%Y-%m-%d")).strip()
+    if not date_from:
+        return {"status": "error", "message": "date_from is required (YYYY-MM-DD)"}
+    try:
+        counts = service.run_kpi_backfill(date_from, date_to)
+        service.kpi_store.mark_backfill_done(date_from, date_to)
+        return {"status": "ok", "date_from": date_from, "date_to": date_to, **counts}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/api/kpi/raw")
+def kpi_raw_events(
+    date_from: str = "",
+    date_to:   str = "",
+) -> Dict[str, Any]:
+    """Return raw KPI events for a date range (for debugging / audit)."""
+    from datetime import date as _date
+    if not date_from:
+        date_from = _date.today().strftime("%Y-%m-%d")
+    if not date_to:
+        date_to = date_from
+    events = service.kpi_store.get_daily_events(date_from, date_to)
+    return {"date_from": date_from, "date_to": date_to, "count": len(events), "events": events}
+
+
+
 @app.get("/")
 def root_health() -> Dict[str, Any]:
     return {"status": "ok", "message": "Use POST /webhook/amocrm for amoCRM webhooks"}
+
+
+@app.get("/debug/config")
+def debug_config() -> Dict[str, Any]:
+    """Show the resolved in-memory configuration — trigger IDs, pipeline names,
+    terminal statuses, keyword filter, etc.  Useful for diagnosing why leads
+    are not being created or why status updates are not firing.
+    """
+    return {
+        "environment": os.getenv("ENVIRONMENT", "dev"),
+        "trigger_status_name": service.cfg.TRIGGER_STATUS_NAME,
+        "trigger_status_names_extra": service.cfg.TRIGGER_STATUS_NAMES_EXTRA,
+        "resolved_trigger_status_ids": sorted(service.trigger_status_ids),
+        "pipeline_keyword": service.cfg.PIPELINE_KEYWORD,
+        "pipelines": {
+            str(pid): pname
+            for pid, pname in service.pipeline_id_to_name.items()
+        },
+        "pipelines_matching_keyword": [
+            f"{pid}: {pname}"
+            for pid, pname in service.pipeline_id_to_name.items()
+            if not service.cfg.PIPELINE_KEYWORD
+            or service.cfg.PIPELINE_KEYWORD in pname.lower()
+        ],
+        "terminal_status_id_to_name": service.terminal_status_id_to_name,
+        "status_id_to_display_name": {
+            str(k): v for k, v in service.status_id_to_display_name.items()
+        },
+        "leads_created_after": service.cfg.LEADS_CREATED_AFTER,
+        "active_sheet_month": service.state.get("active_sheet_month", ""),
+        "worksheet_name": service.cfg.GOOGLE_WORKSHEET_NAME,
+        "webhook_dedup_ttl_sec": service.cfg.WEBHOOK_DEDUP_TTL_SEC,
+    }
 
 
 @app.get("/structure")
