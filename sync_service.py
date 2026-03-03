@@ -1225,6 +1225,107 @@ class SyncService:
         if expired:
             self.flush_state()
 
+    def catchup_trigger_leads(self) -> None:
+        """Poll AMO for leads currently in trigger statuses and add any missing from the sheet.
+
+        Leads can be created directly in a trigger status (e.g. via import, AMO API, or
+        manager manually opening a card that was never staged through a prior status).
+        In those cases AmoCRM never fires a ``lead_status_changed`` webhook, so this
+        catch-up job closes the gap.  Runs at most once every CATCHUP_INTERVAL_SECONDS
+        (default 300 = 5 minutes) to avoid hammering the AMO API.
+        """
+        interval = int(os.getenv("CATCHUP_INTERVAL_SECONDS", "300"))
+        now = time.time()
+        if now - getattr(self, "_last_catchup_ts", 0.0) < interval:
+            return
+        self._last_catchup_ts = now
+
+        # ── Build filter: (pipeline_id, status_id) for each trigger status ──────
+        filter_pairs: List[tuple] = []
+        for pid, status_map in self.pipeline_status_display_to_id.items():
+            pipeline_name = self.pipeline_id_to_name.get(pid, "")
+            if self.cfg.PIPELINE_KEYWORD and self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
+                continue
+            for _display, sid in status_map.items():
+                if sid in self.trigger_status_ids:
+                    filter_pairs.append((pid, sid))
+
+        if not filter_pairs:
+            return
+
+        filter_str = "&".join(
+            f"filter[statuses][{i}][pipeline_id]={pid}&filter[statuses][{i}][status_id]={sid}"
+            for i, (pid, sid) in enumerate(filter_pairs)
+        )
+
+        staff_mapping = self.sheet.get_staff_mapping()
+        added = 0
+        page = 1
+        while True:
+            endpoint = (
+                f"/api/v4/leads?{filter_str}"
+                f"&with=contacts,companies&limit=250&page={page}"
+            )
+            try:
+                data = self.amo.get(endpoint)
+            except RuntimeError as exc:
+                if "204" in str(exc) or "No Content" in str(exc):
+                    break
+                print(f"[WARN] catchup_trigger_leads: AMO request failed: {exc}")
+                break
+
+            leads = (data.get("_embedded") or {}).get("leads") or []
+            if not leads:
+                break
+
+            for lead in leads:
+                lead_id = str(lead.get("id", "")).strip()
+                if not lead_id:
+                    continue
+
+                # Skip leads updated before the configured date cutoff
+                if self.cfg.LEADS_CREATED_AFTER:
+                    if int(lead.get("updated_at", 0) or 0) < self.cfg.LEADS_CREATED_AFTER:
+                        continue
+
+                # Skip leads that are already on the sheet
+                if self.get_known_sheet_status(lead_id):
+                    continue
+
+                # New lead — enrich contacts (phone numbers) then write to sheet
+                try:
+                    lead = self._enrich_lead_contacts(lead)
+                except Exception:
+                    pass
+
+                status_id     = int(lead.get("status_id", 0) or 0)
+                pipeline_id_l = int(lead.get("pipeline_id", 0) or 0)
+                pipeline_name_l = self.pipeline_id_to_name.get(pipeline_id_l, "")
+                responsible_id  = int(lead.get("responsible_user_id", 0) or 0)
+                responsible_name = self.users_map.get(responsible_id, str(responsible_id))
+                status_display  = self.status_id_to_display_name.get(status_id, "В процессе")
+
+                tab_name = self._tab_for_lead(lead)
+                try:
+                    row = build_row(lead, status_display, pipeline_name_l, responsible_name, staff_mapping)
+                    self.sheet.upsert_row(row, tab_name)
+                    self.remember_sheet_status(lead_id, status_display)
+                    self.remember_lead_tab(lead_id, tab_name)
+                    actual_order = str(row[ORDER_NUM_COL_INDEX]) if len(row) > ORDER_NUM_COL_INDEX else ""
+                    self.remember_sheet_order_number(lead_id, actual_order)
+                    added += 1
+                    print(f"[CATCHUP] lead {lead_id} added to sheet (status={status_display})")
+                except Exception as exc:
+                    print(f"[CATCHUP] Failed to write lead {lead_id}: {exc}")
+
+            if not (data.get("_links") or {}).get("next"):
+                break
+            page += 1
+
+        if added:
+            self.flush_state()
+            print(f"[CATCHUP] Done — {added} previously-missing lead(s) written to sheet.")
+
     def _set_expiry_for_status(self, lead_id: str, status_display: str) -> None:
         """If status_display has a configured lifetime, start (or overwrite) the countdown."""
         seconds = self._EXPIRY_SECONDS.get(status_display)
@@ -1792,6 +1893,7 @@ def on_startup() -> None:
             try:
                 service.check_and_rotate_sheet()
                 service.expire_finished_leads()
+                service.catchup_trigger_leads()
                 service.sync_sheet_to_amo()
                 backoff = 0
             except Exception as exc:
