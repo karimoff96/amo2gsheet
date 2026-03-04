@@ -84,6 +84,28 @@ ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
 
+# ── Normalization for AMO status names ───────────────────────────────────────
+# Some pipelines (e.g. Rushana) have status names with:
+#  • Mixed Latin/Cyrillic lookalike chars  (Latin 'A'→Cyrillic 'А', 'O'→'О', etc.)
+#  • Non-standard casing                   ('заказ отпрAвлен', 'Oтказ', 'думка')
+# This table maps the common Latin lookalikes to their Cyrillic counterparts so
+# that a simple .upper() comparison works reliably across all pipelines.
+_LATIN_TO_CYR = str.maketrans(
+    "ABCEHKMOPTXabcehopcx",
+    "АВСЕНКМОРТХавсенорсх",
+)
+
+
+def _normalize_amo_name(name: str) -> str:
+    """Replace Latin lookalikes with Cyrillic equivalents, then lower-case."""
+    return name.translate(_LATIN_TO_CYR).lower()
+
+
+# Pre-normalized lookup:  NORMALIZED_KEY → display value
+_STATUS_DISPLAY_NORMALIZED: Dict[str, str] = {
+    _normalize_amo_name(k): v for k, v in STATUS_DISPLAY_MAP.items()
+}
+
 # AMO display name to target when admin fills in Заказ № on the sheet.
 # "Заказ отправлен" maps to display name "У курера" in STATUS_DISPLAY_MAP.
 ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
@@ -1120,7 +1142,13 @@ class SyncService:
                 if not status_id or not status_name:
                     continue
 
-                display_name = STATUS_DISPLAY_MAP.get(status_name, status_name)
+                # Prefer exact match; fall back to normalized (handles mixed
+                # Latin/Cyrillic chars and casing variants like Rushana's pipeline).
+                display_name = (
+                    STATUS_DISPLAY_MAP.get(status_name)
+                    or _STATUS_DISPLAY_NORMALIZED.get(_normalize_amo_name(status_name))
+                    or status_name
+                )
                 self.pipeline_status_name_to_id[pipeline_id][status_name] = status_id
                 self.pipeline_status_display_to_id[pipeline_id][display_name] = status_id
                 self.status_id_to_display_name[status_id] = display_name
