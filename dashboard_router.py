@@ -189,22 +189,7 @@ def create_dashboard_router(service) -> APIRouter:
                 staff_by_code = _staff_cache["data"]
             else:
                 try:
-                    ws = service.sheet._get_or_create_sheet("Staff")
-                    rows = ws.get_all_values()
-                    for row in rows[1:]:
-                        if len(row) < 3:
-                            continue
-                        code      = str(row[1]).strip()  # Код сотрудника
-                        full_name = str(row[2]).strip()  # Сотрудник
-                        dept      = str(row[3]).strip() if len(row) >= 4 else ""
-                        if not full_name or not code:
-                            continue
-                        info = {"code": code, "group": dept, "full_name": full_name}
-                        staff_by_code[code] = info
-                        try:
-                            staff_by_code[str(int(code))] = info
-                        except ValueError:
-                            pass
+                    staff_by_code = service.get_staff_list()
                     _staff_cache["data"] = staff_by_code
                     _staff_cache["ts"]   = now_ts
                 except Exception as exc:
@@ -423,22 +408,7 @@ def create_dashboard_router(service) -> APIRouter:
                 staff_by_code = _staff_cache["data"]
             else:
                 try:
-                    ws = service.sheet._get_or_create_sheet("Staff")
-                    rows = ws.get_all_values()
-                    for row in rows[1:]:
-                        if len(row) < 3:
-                            continue
-                        code      = str(row[1]).strip()
-                        full_name = str(row[2]).strip()
-                        dept      = str(row[3]).strip() if len(row) >= 4 else ""
-                        if not full_name or not code:
-                            continue
-                        info = {"code": code, "group": dept, "full_name": full_name}
-                        staff_by_code[code] = info
-                        try:
-                            staff_by_code[str(int(code))] = info
-                        except ValueError:
-                            pass
+                    staff_by_code = service.get_staff_list()
                     _staff_cache["data"] = staff_by_code
                     _staff_cache["ts"]   = now_ts
                 except Exception as exc:

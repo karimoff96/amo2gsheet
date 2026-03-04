@@ -84,28 +84,6 @@ ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
 
-# ── Normalization for AMO status names ───────────────────────────────────────
-# Some pipelines (e.g. Rushana) have status names with:
-#  • Mixed Latin/Cyrillic lookalike chars  (Latin 'A'→Cyrillic 'А', 'O'→'О', etc.)
-#  • Non-standard casing                   ('заказ отпрAвлен', 'Oтказ', 'думка')
-# This table maps the common Latin lookalikes to their Cyrillic counterparts so
-# that a simple .upper() comparison works reliably across all pipelines.
-_LATIN_TO_CYR = str.maketrans(
-    "ABCEHKMOPTXabcehopcx",
-    "АВСЕНКМОРТХавсенорсх",
-)
-
-
-def _normalize_amo_name(name: str) -> str:
-    """Replace Latin lookalikes with Cyrillic equivalents, then lower-case."""
-    return name.translate(_LATIN_TO_CYR).lower()
-
-
-# Pre-normalized lookup:  NORMALIZED_KEY → display value
-_STATUS_DISPLAY_NORMALIZED: Dict[str, str] = {
-    _normalize_amo_name(k): v for k, v in STATUS_DISPLAY_MAP.items()
-}
-
 # AMO display name to target when admin fills in Заказ № on the sheet.
 # "Заказ отправлен" maps to display name "У курера" in STATUS_DISPLAY_MAP.
 ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
@@ -130,8 +108,9 @@ AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
 # ── KPI status groupings (used by KPI store event recording) ─────────────────
 # Consul: the lead enters the consultation step — this is the "Лид" credit.
 KPI_CONSUL_DISPLAY_NAMES: set[str] = {"Консультация"}
-# Zakas: the lead reaches any confirmed-order stage.
-KPI_ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ", "В процессе", "У курера", "Успешно"}
+# Zakas: ONLY the first confirmed-order stage entry ("Заказ").
+# В процессе / У курера / Успешно are downstream progress — NOT new sales.
+KPI_ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ"}
 # Dumka: the lead is in a "thinking / hesitating" state.
 KPI_DUMKA_DISPLAY_NAMES: set[str] = {"Раздумье"}
 
@@ -840,24 +819,13 @@ class SheetSync:
                 ws.update(values=[row_data], range_name=f"A{row_num}")
                 return row_num
 
-            # Lead not found in cached index — the cache might be stale.
-            # Force a fresh rebuild from the actual sheet before concluding
-            # the lead is truly absent. This is the last line of defence
-            # against duplicate rows caused by any stale-cache scenario.
-            self._build_row_index(ws, ws_name)
-            row_idx = self._row_index[ws_name]
-            row_num = row_idx.get(lead_id)
-            if row_num:
-                ws.update(values=[row_data], range_name=f"A{row_num}")
-                return row_num
-
             # Use append_rows instead of a position-specific update so that the row
             # is always placed directly after the last real data row on the sheet,
             # regardless of whether _row_count is stale (e.g. after an external
             # manual deletion).  This prevents gaps / empty rows from accumulating.
             result = ws.append_rows(
                 [row_data],
-                value_input_option="RAW",
+                value_input_option="USER_ENTERED",
                 insert_data_option="INSERT_ROWS",
             )
             # Parse the actual row number from the API response:
@@ -1142,13 +1110,7 @@ class SyncService:
                 if not status_id or not status_name:
                     continue
 
-                # Prefer exact match; fall back to normalized (handles mixed
-                # Latin/Cyrillic chars and casing variants like Rushana's pipeline).
-                display_name = (
-                    STATUS_DISPLAY_MAP.get(status_name)
-                    or _STATUS_DISPLAY_NORMALIZED.get(_normalize_amo_name(status_name))
-                    or status_name
-                )
+                display_name = STATUS_DISPLAY_MAP.get(status_name, status_name)
                 self.pipeline_status_name_to_id[pipeline_id][status_name] = status_id
                 self.pipeline_status_display_to_id[pipeline_id][display_name] = status_id
                 self.status_id_to_display_name[status_id] = display_name
@@ -1160,13 +1122,10 @@ class SyncService:
                     if _tn and _tn not in all_trigger_names:
                         all_trigger_names.append(_tn)
 
-                # Match trigger by raw AMO status name ONLY.
-                # Do NOT match by display name — "ЗАКАЗ БЕЗ НУМЕРАЦИИ" maps to display
-                # "В процессе", and matching by display would make every status that also
-                # displays as "В процессе" (e.g. a real "В процессе" operational stage)
-                # fire sheet-row creation, causing duplicate/unexpected leads.
+                # Match trigger by raw name OR display name across ALL configured trigger names.
                 for t_name in all_trigger_names:
-                    if status_name == t_name:
+                    t_display = STATUS_DISPLAY_MAP.get(t_name, t_name)
+                    if status_name == t_name or display_name == t_display:
                         self.trigger_status_ids.add(status_id)
                         break
 
@@ -1266,107 +1225,6 @@ class SyncService:
             self.forget_lead(lid)
         if expired:
             self.flush_state()
-
-    def catchup_trigger_leads(self) -> None:
-        """Poll AMO for leads currently in trigger statuses and add any missing from the sheet.
-
-        Leads can be created directly in a trigger status (e.g. via import, AMO API, or
-        manager manually opening a card that was never staged through a prior status).
-        In those cases AmoCRM never fires a ``lead_status_changed`` webhook, so this
-        catch-up job closes the gap.  Runs at most once every CATCHUP_INTERVAL_SECONDS
-        (default 300 = 5 minutes) to avoid hammering the AMO API.
-        """
-        interval = int(os.getenv("CATCHUP_INTERVAL_SECONDS", "300"))
-        now = time.time()
-        if now - getattr(self, "_last_catchup_ts", 0.0) < interval:
-            return
-        self._last_catchup_ts = now
-
-        # ── Build filter: (pipeline_id, status_id) for each trigger status ──────
-        filter_pairs: List[tuple] = []
-        for pid, status_map in self.pipeline_status_display_to_id.items():
-            pipeline_name = self.pipeline_id_to_name.get(pid, "")
-            if self.cfg.PIPELINE_KEYWORD and self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
-                continue
-            for _display, sid in status_map.items():
-                if sid in self.trigger_status_ids:
-                    filter_pairs.append((pid, sid))
-
-        if not filter_pairs:
-            return
-
-        filter_str = "&".join(
-            f"filter[statuses][{i}][pipeline_id]={pid}&filter[statuses][{i}][status_id]={sid}"
-            for i, (pid, sid) in enumerate(filter_pairs)
-        )
-
-        staff_mapping = self.sheet.get_staff_mapping()
-        added = 0
-        page = 1
-        while True:
-            endpoint = (
-                f"/api/v4/leads?{filter_str}"
-                f"&with=contacts,companies&limit=250&page={page}"
-            )
-            try:
-                data = self.amo.get(endpoint)
-            except RuntimeError as exc:
-                if "204" in str(exc) or "No Content" in str(exc):
-                    break
-                print(f"[WARN] catchup_trigger_leads: AMO request failed: {exc}")
-                break
-
-            leads = (data.get("_embedded") or {}).get("leads") or []
-            if not leads:
-                break
-
-            for lead in leads:
-                lead_id = str(lead.get("id", "")).strip()
-                if not lead_id:
-                    continue
-
-                # Skip leads updated before the configured date cutoff
-                if self.cfg.LEADS_CREATED_AFTER:
-                    if int(lead.get("updated_at", 0) or 0) < self.cfg.LEADS_CREATED_AFTER:
-                        continue
-
-                # Skip leads that are already on the sheet
-                if self.get_known_sheet_status(lead_id):
-                    continue
-
-                # New lead — enrich contacts (phone numbers) then write to sheet
-                try:
-                    lead = self._enrich_lead_contacts(lead)
-                except Exception:
-                    pass
-
-                status_id     = int(lead.get("status_id", 0) or 0)
-                pipeline_id_l = int(lead.get("pipeline_id", 0) or 0)
-                pipeline_name_l = self.pipeline_id_to_name.get(pipeline_id_l, "")
-                responsible_id  = int(lead.get("responsible_user_id", 0) or 0)
-                responsible_name = self.users_map.get(responsible_id, str(responsible_id))
-                status_display  = self.status_id_to_display_name.get(status_id, "В процессе")
-
-                tab_name = self._tab_for_lead(lead)
-                try:
-                    row = build_row(lead, status_display, pipeline_name_l, responsible_name, staff_mapping)
-                    self.sheet.upsert_row(row, tab_name)
-                    self.remember_sheet_status(lead_id, status_display)
-                    self.remember_lead_tab(lead_id, tab_name)
-                    actual_order = str(row[ORDER_NUM_COL_INDEX]) if len(row) > ORDER_NUM_COL_INDEX else ""
-                    self.remember_sheet_order_number(lead_id, actual_order)
-                    added += 1
-                    print(f"[CATCHUP] lead {lead_id} added to sheet (status={status_display})")
-                except Exception as exc:
-                    print(f"[CATCHUP] Failed to write lead {lead_id}: {exc}")
-
-            if not (data.get("_links") or {}).get("next"):
-                break
-            page += 1
-
-        if added:
-            self.flush_state()
-            print(f"[CATCHUP] Done — {added} previously-missing lead(s) written to sheet.")
 
     def _set_expiry_for_status(self, lead_id: str, status_display: str) -> None:
         """If status_display has a configured lifetime, start (or overwrite) the countdown."""
@@ -1654,7 +1512,6 @@ class SyncService:
         skipped_duplicate = 0
         skipped_status_mismatch = 0
         skipped_too_old = 0
-        skipped_pipeline_kw = 0
         seen_status_ids: List[int] = []
 
         staff_mapping = self.sheet.get_staff_mapping()
@@ -1712,35 +1569,19 @@ class SyncService:
                 wh_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 wh_pipeline_name = self.pipeline_id_to_name.get(wh_pipeline_id, "")
                 if self.cfg.PIPELINE_KEYWORD not in wh_pipeline_name.lower():
-                    skipped_pipeline_kw += 1
-                    print(
-                        f"[SKIP] lead {lead_id}: pipeline '{wh_pipeline_name}' "
-                        f"does not match PIPELINE_KEYWORD='{self.cfg.PIPELINE_KEYWORD}'"
-                    )
                     continue
 
-            # If the webhook fired for a trigger status but the re-fetched lead is
-            # already on a different status (race condition / manager moved it quickly),
-            # use the webhook status to decide what to write rather than silently dropping.
-            effective_status_id = status_id
-            if is_trigger and status_id not in self.trigger_status_ids:
-                print(
-                    f"[INFO] lead {lead_id}: webhook trigger status {webhook_status_id} but "
-                    f"re-fetched status is {status_id} — using webhook status to create row"
-                )
-                effective_status_id = webhook_status_id
-
-            if effective_status_id in self.trigger_status_ids:
+            if status_id in self.trigger_status_ids:
                 trigger_matches += 1
                 trigger_display = STATUS_DISPLAY_MAP.get(self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME)
                 pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
                 pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
-
+                
                 responsible_id = int(full_lead.get("responsible_user_id", 0) or 0)
                 responsible_name = self.users_map.get(responsible_id, str(responsible_id))
-
-                current_status_name = self.status_id_to_display_name.get(effective_status_id, trigger_display)
+                
+                current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
                 
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
@@ -1755,7 +1596,7 @@ class SyncService:
                 written += 1
                 continue
 
-            terminal_name = self.terminal_status_id_to_name.get(str(effective_status_id))
+            terminal_name = self.terminal_status_id_to_name.get(str(status_id))
             if terminal_name:
                 terminal_matches += 1
                 lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
@@ -1802,7 +1643,6 @@ class SyncService:
             "seen_status_ids": sorted(list(set(seen_status_ids))),
             "resolved_trigger_status_ids": sorted(self.trigger_status_ids),
             "configured_terminal_status_ids": self.cfg.STATUS_MAP,
-            "skipped_pipeline_keyword": skipped_pipeline_kw,
         }
 
     def sync_sheet_to_amo(self) -> None:
@@ -1892,11 +1732,55 @@ class SyncService:
         self.flush_state()
 
 
+# ────────────────────────────────────────────────────────────────────────────────
+class DashboardContext:
+    """Тонкий read-only фасад над SyncService — всё, что нужно dashboard_router.
+
+    Дашборд никогда не получает прямой доступ к SheetSync: опасные операции
+    Google Sheets (запись, создание листов) инкапсулированы в get_staff_list().
+    """
+
+    def __init__(self, svc: "SyncService") -> None:
+        self.kpi_store               = svc.kpi_store
+        self.amo                     = svc.amo
+        self.cfg                     = svc.cfg
+        # Live references — always reflect the latest AMO structure
+        self.pipeline_id_to_name     = svc.pipeline_id_to_name
+        self.status_id_to_display_name = svc.status_id_to_display_name
+        self._sheet                  = svc.sheet  # private, never exposed directly
+
+    def get_staff_list(self) -> Dict[str, Dict]:
+        """Return {code → {code, group, full_name}} read from the Staff worksheet.
+
+        Callers are responsible for caching the result if rapid repeated
+        calls must be avoided (dashboard_router has its own TTL cache).
+        """
+        ws = self._sheet._get_or_create_sheet("Staff")
+        rows = ws.get_all_values()
+        out: Dict[str, Dict] = {}
+        for row in rows[1:]:
+            if len(row) < 3:
+                continue
+            code      = str(row[1]).strip()
+            full_name = str(row[2]).strip()
+            dept      = str(row[3]).strip() if len(row) >= 4 else ""
+            if not full_name or not code:
+                continue
+            info = {"code": code, "group": dept, "full_name": full_name}
+            out[code] = info
+            try:
+                out[str(int(code))] = info
+            except ValueError:
+                pass
+        return out
+
+
 service = SyncService()
 app = FastAPI(title="amoCRM <-> Google Sheets Sync")
 
-# Mount staff KPI dashboard (completely independent from sync logic)
-app.include_router(create_dashboard_router(service))
+# Mount staff KPI dashboard via a read-only DashboardContext facade
+# (dashboard_router never touches SheetSync write methods directly)
+app.include_router(create_dashboard_router(DashboardContext(service)))
 
 
 @app.on_event("startup")
@@ -1935,7 +1819,6 @@ def on_startup() -> None:
             try:
                 service.check_and_rotate_sheet()
                 service.expire_finished_leads()
-                service.catchup_trigger_leads()
                 service.sync_sheet_to_amo()
                 backoff = 0
             except Exception as exc:
@@ -1996,6 +1879,31 @@ async def kpi_backfill_endpoint(request: Request) -> Dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
+@app.post("/api/kpi/reset")
+async def kpi_reset_endpoint(request: Request) -> Dict[str, Any]:
+    """Wipe ALL KPI data and re-run a full backfill for the given date range.
+
+    Body JSON: {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}
+    WARNING: this deletes every existing KPI event before re-filling.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    from datetime import date as _date
+    date_from = (payload.get("date_from") or "").strip()
+    date_to   = (payload.get("date_to")   or _date.today().strftime("%Y-%m-%d")).strip()
+    if not date_from:
+        return {"status": "error", "message": "date_from is required (YYYY-MM-DD)"}
+    try:
+        service.kpi_store.clear_all_data()
+        counts = service.run_kpi_backfill(date_from, date_to)
+        service.kpi_store.mark_backfill_done(date_from, date_to)
+        return {"status": "ok", "date_from": date_from, "date_to": date_to, **counts}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
 @app.get("/api/kpi/raw")
 def kpi_raw_events(
     date_from: str = "",
@@ -2015,39 +1923,6 @@ def kpi_raw_events(
 @app.get("/")
 def root_health() -> Dict[str, Any]:
     return {"status": "ok", "message": "Use POST /webhook/amocrm for amoCRM webhooks"}
-
-
-@app.get("/debug/config")
-def debug_config() -> Dict[str, Any]:
-    """Show the resolved in-memory configuration — trigger IDs, pipeline names,
-    terminal statuses, keyword filter, etc.  Useful for diagnosing why leads
-    are not being created or why status updates are not firing.
-    """
-    return {
-        "environment": os.getenv("ENVIRONMENT", "dev"),
-        "trigger_status_name": service.cfg.TRIGGER_STATUS_NAME,
-        "trigger_status_names_extra": service.cfg.TRIGGER_STATUS_NAMES_EXTRA,
-        "resolved_trigger_status_ids": sorted(service.trigger_status_ids),
-        "pipeline_keyword": service.cfg.PIPELINE_KEYWORD,
-        "pipelines": {
-            str(pid): pname
-            for pid, pname in service.pipeline_id_to_name.items()
-        },
-        "pipelines_matching_keyword": [
-            f"{pid}: {pname}"
-            for pid, pname in service.pipeline_id_to_name.items()
-            if not service.cfg.PIPELINE_KEYWORD
-            or service.cfg.PIPELINE_KEYWORD in pname.lower()
-        ],
-        "terminal_status_id_to_name": service.terminal_status_id_to_name,
-        "status_id_to_display_name": {
-            str(k): v for k, v in service.status_id_to_display_name.items()
-        },
-        "leads_created_after": service.cfg.LEADS_CREATED_AFTER,
-        "active_sheet_month": service.state.get("active_sheet_month", ""),
-        "worksheet_name": service.cfg.GOOGLE_WORKSHEET_NAME,
-        "webhook_dedup_ttl_sec": service.cfg.WEBHOOK_DEDUP_TTL_SEC,
-    }
 
 
 @app.get("/structure")

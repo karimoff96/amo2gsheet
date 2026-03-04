@@ -176,12 +176,15 @@ class KPIStore:
     ) -> bool:
         """Record a ЗАКАЗ event.
 
-        • Looks up the staff from lead_consul_log.
-        • Enforces the ДУМКА recovery window: if the most recent ДУМКА for this
-          lead was more than ``dumka_recovery_days`` days before ``event_date``,
-          the order is NOT credited and False is returned.
-        • Multiple ЗАКАЗ per lead are allowed (ДУМКА recovery can happen
-          several times within the window).
+        Deduplication rules
+        ───────────────────
+        1. No prior zakas → allow (first sale).
+        2. Prior zakas exists, NO ДУМКА after it → block.  The lead is simply
+           moving through downstream stages (В процессе → У курера → Успешно);
+           this is NOT a new sale.
+        3. Prior zakas exists AND a ДУМКА occurred after it → ДУМКА recovery
+           case.  Allow only if the gap between that ДУМКА and event_date is
+           within ``dumka_recovery_days``.
         """
         if not lead_id:
             return False
@@ -198,15 +201,28 @@ class KPIStore:
                 staff_code   = consul_row["staff_code"]
                 pipeline_use = pipeline_name or consul_row["pipeline_name"]
 
-                # Enforce ДУМКА recovery window
-                dumka_row = conn.execute(
+                # Check whether this lead already has a zakas event
+                last_zakas = conn.execute(
                     "SELECT event_date FROM kpi_events "
-                    "WHERE lead_id = ? AND event_type = 'dumka' "
+                    "WHERE lead_id = ? AND event_type = 'zakas' "
                     "ORDER BY event_date DESC LIMIT 1",
                     (str(lead_id),),
                 ).fetchone()
-                if dumka_row:
-                    dumka_date = datetime.strptime(dumka_row["event_date"], "%Y-%m-%d").date()
+
+                if last_zakas:
+                    # Rule 2 / 3: look for a ДУМКА that occurred AFTER the last zakas
+                    dumka_after = conn.execute(
+                        "SELECT event_date FROM kpi_events "
+                        "WHERE lead_id = ? AND event_type = 'dumka' "
+                        "AND event_date >= ? "
+                        "ORDER BY event_date DESC LIMIT 1",
+                        (str(lead_id), last_zakas["event_date"]),
+                    ).fetchone()
+                    if not dumka_after:
+                        # No ДУМКА since the last zakas → downstream stage hop, not a new sale
+                        return False
+                    # ДУМКА recovery path — enforce window
+                    dumka_date = datetime.strptime(dumka_after["event_date"], "%Y-%m-%d").date()
                     order_date = datetime.strptime(event_date, "%Y-%m-%d").date()
                     days_since = (order_date - dumka_date).days
                     if days_since > self.dumka_recovery_days:
@@ -372,6 +388,19 @@ class KPIStore:
                     "INSERT INTO backfill_log (date_from, date_to, completed_at) VALUES (?, ?, ?)",
                     (date_from, date_to, self._now_str()),
                 )
+
+    def clear_all_data(self) -> None:
+        """Delete ALL KPI events, consul log, and backfill records.
+
+        Call this before a full re-backfill to start from a clean state.
+        Table schemas are preserved; only row data is wiped.
+        """
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM kpi_events")
+                conn.execute("DELETE FROM lead_consul_log")
+                conn.execute("DELETE FROM backfill_log")
+        print("[KPI] clear_all_data: all tables wiped")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Back-fill from AMO Events API
