@@ -175,7 +175,11 @@ ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
 # "Отказ" moves the lead to the pipeline's reject step.
 SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
     "В процессе": "В процессе",
-    "У курера":   "Успешно",
+    # "У курера" in the sheet means the order is with the courier — the matching
+    # AMO status is "ЗАКАЗ ОТПРАВЛЕН" (display name "У курера"), NOT
+    # "Успешно реализовано".  Using the display name here causes the reverse
+    # lookup in pipeline_status_display_to_id to resolve to the correct status ID.
+    "У курера":   "У курера",
     "Успешно":    "Успешно",
     "Отказ":      "Отказ",
 }
@@ -979,19 +983,39 @@ class SheetSync:
         for tab_name in tabs_to_scan:
             try:
                 ws = self._get_or_create_month_sheet(tab_name)
-                for row in self._all_rows(ws):
+                # Read once — reuse the same get_all_values() result to both
+                # populate the output list AND refresh the in-memory row index so
+                # that subsequent update_status / find_row calls use correct row
+                # numbers even if the sheet was externally modified since last build.
+                all_vals = ws.get_all_values()
+                if not all_vals:
+                    continue
+                new_idx: Dict[str, int] = {}
+                last_data_row = 0
+                for i, row in enumerate(all_vals):
+                    if any(str(c).strip() for c in row):
+                        last_data_row = i + 1
+                    if i == 0:
+                        continue  # skip header row
                     if len(row) <= max(ID_COL_INDEX, STATUS_COL_INDEX):
                         continue
                     lead_id = str(row[ID_COL_INDEX]).strip()
+                    if not lead_id:
+                        continue
+                    new_idx[lead_id] = i + 1  # 1-based sheet row number
                     status = str(row[STATUS_COL_INDEX]).strip()
                     order_number = str(row[ORDER_NUM_COL_INDEX]).strip() if len(row) > ORDER_NUM_COL_INDEX else ""
-                    if lead_id:
-                        out.append({
-                            "lead_id": lead_id,
-                            "status": status,
-                            "order_number": order_number,
-                            "tab_name": tab_name,
-                        })
+                    out.append({
+                        "lead_id": lead_id,
+                        "status": status,
+                        "order_number": order_number,
+                        "tab_name": tab_name,
+                    })
+                # Atomically replace the cached row index with the fresh one.
+                # This prevents update_status from writing to wrong rows when
+                # external scripts or users insert/delete rows between poll cycles.
+                self._row_index[tab_name] = new_idx
+                self._row_count[tab_name] = last_data_row
             except Exception as exc:
                 _log.warning("iter_lead_statuses: could not read tab '%s': %s", tab_name, exc)
         return out
