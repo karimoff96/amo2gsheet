@@ -166,6 +166,12 @@ _STATUS_DISPLAY_NORMALIZED: Dict[str, str] = {
     _normalize_amo_name(k): v for k, v in STATUS_DISPLAY_MAP.items()
 }
 
+# Plain ASCII-lowercase fallback: catches mixed-case variants like "Otkaz", "Zakas",
+# "заказ без нумерации" — where the letters are not visual lookalikes but just wrong case.
+_STATUS_DISPLAY_LOWERED: Dict[str, str] = {
+    k.lower(): v for k, v in STATUS_DISPLAY_MAP.items()
+}
+
 # AMO display name to target when admin fills in Заказ № on the sheet.
 # "Заказ отправлен" maps to display name "У курера" in STATUS_DISPLAY_MAP.
 ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
@@ -1240,6 +1246,7 @@ class SyncService:
                 display_name = (
                     STATUS_DISPLAY_MAP.get(status_name)
                     or _STATUS_DISPLAY_NORMALIZED.get(_normalize_amo_name(status_name))
+                    or _STATUS_DISPLAY_LOWERED.get(status_name.lower())
                     or status_name
                 )
                 self.pipeline_status_name_to_id[pipeline_id][status_name] = status_id
@@ -1425,6 +1432,7 @@ class SyncService:
                 candidate = (
                     STATUS_DISPLAY_MAP.get(raw_status)
                     or _STATUS_DISPLAY_NORMALIZED.get(normalized)
+                    or _STATUS_DISPLAY_LOWERED.get(raw_status.lower())
                 )
                 if candidate and candidate != raw_status:
                     _log_lead.warning(
