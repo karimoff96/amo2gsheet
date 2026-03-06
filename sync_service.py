@@ -1,9 +1,11 @@
 import json
+import logging
 import os
 import re
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
@@ -16,6 +18,65 @@ from dashboard_router import create_dashboard_router
 from kpi_store import KPIStore
 
 load_env()
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+# Four rotating log files, all capped at 10 MB with 10 backups each:
+#   app.log      — everything (mirrors every logger)
+#   leads.log    — per-lead lifecycle events (writes, status changes, expiry)
+#   webhooks.log — incoming webhook batches and per-lead routing decisions
+#   amo_api.log  — every AMO API call: method, URL, HTTP status, duration
+#
+# Set LOG_DIR in .env to override the default ./logs directory.
+# The same messages also print to stdout so systemd journald keeps working.
+
+def _setup_logging() -> None:
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)-5s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    def _file_handler(filename: str) -> RotatingFileHandler:
+        h = RotatingFileHandler(
+            log_dir / filename,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=10,
+            encoding="utf-8",
+        )
+        h.setFormatter(fmt)
+        return h
+
+    # Root "amo2gsheet" logger → app.log + stdout
+    root = logging.getLogger("amo2gsheet")
+    root.setLevel(logging.DEBUG)
+    if not root.handlers:  # avoid double-adding on reload
+        root.addHandler(_file_handler("app.log"))
+        _console = logging.StreamHandler()
+        _console.setFormatter(fmt)
+        root.addHandler(_console)
+
+    # Child loggers mirror to root (app.log) AND write to their own file
+    for name, fname in (
+        ("amo2gsheet.leads",    "leads.log"),
+        ("amo2gsheet.webhooks", "webhooks.log"),
+        ("amo2gsheet.amo_api",  "amo_api.log"),
+    ):
+        child = logging.getLogger(name)
+        child.setLevel(logging.DEBUG)
+        if not child.handlers:
+            child.addHandler(_file_handler(fname))
+        child.propagate = True  # also write to app.log
+
+
+_setup_logging()
+
+# Module-level logger aliases used throughout this file
+_log      = logging.getLogger("amo2gsheet")
+_log_lead = logging.getLogger("amo2gsheet.leads")
+_log_wh   = logging.getLogger("amo2gsheet.webhooks")
+_log_amo  = logging.getLogger("amo2gsheet.amo_api")
 
 
 COLUMNS = [
@@ -175,7 +236,7 @@ def _parse_leads_created_after(raw: str) -> int:
             return int(datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp())
         except ValueError:
             continue
-    print(f"[WARN] LEADS_CREATED_AFTER='{raw}' is not a recognized format. Using 0.")
+    _log.warning("LEADS_CREATED_AFTER='%s' is not a recognized format. Using 0.", raw)
     return 0
 
 
@@ -312,12 +373,20 @@ class AmoClient:
         """Execute an AMO API call with throttle and automatic 429 back-off retry."""
         for attempt in range(1, 6):
             self._throttle()
+            t0 = time.monotonic()
             r = requests.request(method, url, headers=headers, timeout=30, **kwargs)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            # Strip base URL for brevity in logs
+            short_url = url.replace(self.base_url, "")
             if r.status_code == 429:
                 wait = min(attempt * 10, 60)
-                print(f"[WARN] AMO 429 on {method} {url}, retrying in {wait}s (attempt {attempt}/5)")
+                _log_amo.warning(
+                    "AMO 429 %s %s — retrying in %ds (attempt %d/5)",
+                    method, short_url, wait, attempt,
+                )
                 time.sleep(wait)
                 continue
+            _log_amo.debug("%s %s → %d (%dms)", method, short_url, r.status_code, elapsed_ms)
             return r
         return r  # return last response after exhausting retries
 
@@ -384,7 +453,7 @@ class AmoClient:
             self._token_validated_ts = now
             return access_token
         if not refresh_token and self.cfg.AMO_AUTH_CODE:
-            print("[INFO] No refresh token found, trying AMO_AUTH_CODE bootstrap...")
+            _log.info("No refresh token found, trying AMO_AUTH_CODE bootstrap...")
             try:
                 data = self.exchange_code(self.cfg.AMO_AUTH_CODE)
                 token = data["access_token"]
@@ -439,6 +508,7 @@ class AmoClient:
         if r.status_code == 204 or not r.text:
             return {}
         if r.status_code >= 400:
+            _log_amo.error("GET %s failed: %d %s", endpoint, r.status_code, r.text[:200])
             raise RuntimeError(f"GET {endpoint} failed: {r.status_code} {r.text}")
         return r.json()
 
@@ -542,6 +612,7 @@ class AmoClient:
 
     def patch(self, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
         token = self.get_access_token()
+        _log_amo.debug("PATCH %s  body=%s", endpoint, json.dumps(body, ensure_ascii=False)[:300])
         r = self._api_request(
             "PATCH",
             f"{self.base_url}{endpoint}",
@@ -549,6 +620,7 @@ class AmoClient:
             json=body,
         )
         if r.status_code >= 400:
+            _log_amo.error("PATCH %s failed: %d %s", endpoint, r.status_code, r.text[:200])
             raise RuntimeError(f"PATCH {endpoint} failed: {r.status_code} {r.text}")
         return r.json() if r.text else {}
 
@@ -632,9 +704,9 @@ class SheetSync:
             try:
                 ws = self.spreadsheet.worksheet(main_name)
                 ws.update_title(archive_tab_name)
-                print(f"[INFO] Worksheet '{main_name}' renamed to '{archive_tab_name}'")
+                _log.info("Worksheet '%s' renamed to '%s'", main_name, archive_tab_name)
             except gspread.WorksheetNotFound:
-                print(f"[WARN] Worksheet '{main_name}' not found during rotation — skipping rename")
+                _log.warning("Worksheet '%s' not found during rotation — skipping rename", main_name)
             # Clear the sheet cache so the renamed tab is no longer served as the active sheet
             self._sheets.pop(main_name, None)
             self._sheets.pop(archive_tab_name, None)
@@ -643,7 +715,7 @@ class SheetSync:
             self._invalidate_row_index(archive_tab_name)
             # Create (or re-open) a new active sheet with headers + dropdown
             self._get_or_create_sheet(main_name)
-            print(f"[INFO] New active worksheet '{main_name}' created for the new month")
+            _log.info("New active worksheet '%s' created for the new month.", main_name)
 
     def get_staff_mapping(self) -> Dict[str, str]:
         """Fetch the staff mapping from the 'Staff' sheet (result is cached for STAFF_CACHE_TTL_SEC)."""
@@ -671,7 +743,7 @@ class SheetSync:
             self._staff_cache_ts = now
             return mapping
         except Exception as e:
-            print(f"[WARN] Could not load Staff sheet: {e}")
+            _log.warning("Could not load Staff sheet: %s", e)
             return self._staff_cache  # Return stale cache on error rather than empty
 
     # Statuses that can be chosen from the dropdown in the "Статус" column
@@ -691,7 +763,7 @@ class SheetSync:
                 showCustomUi=True,
             )
         except Exception as e:
-            print(f"[WARN] Could not set dropdown validation on {row_range}: {e}")
+            _log.warning("Could not set dropdown validation on %s: %s", row_range, e)
 
     def _all_rows(self, ws) -> List[List[str]]:
         values = ws.get_all_values()
@@ -721,7 +793,7 @@ class SheetSync:
         if not empty:
             return all_vals
 
-        print(f"[INFO] '{ws_name}': found {len(empty)} empty row(s) — removing automatically.")
+        _log_lead.info("SHEET '%s': found %d empty row(s) — removing.", ws_name, len(empty))
 
         # Group consecutive indices so we can delete ranges in one call each
         groups: List[tuple] = []
@@ -738,9 +810,9 @@ class SheetSync:
         for s, e in groups:
             ws.delete_rows(s, e)
             deleted += e - s + 1
-            print(f"[INFO] '{ws_name}': deleted rows {s}–{e} ({e - s + 1} row(s)).")
+            _log_lead.info("SHEET '%s': deleted empty rows %d–%d (%d row(s)).", ws_name, s, e, e - s + 1)
 
-        print(f"[INFO] '{ws_name}': purged {deleted} empty row(s) successfully.")
+        _log_lead.info("SHEET '%s': purged %d empty row(s) total.", ws_name, deleted)
 
         # Return the cleaned data so _build_row_index doesn't need a second fetch
         cleaned = [row for i, row in enumerate(all_vals)
@@ -770,9 +842,9 @@ class SheetSync:
         for lid, row_nums in occurrences.items():
             if len(row_nums) > 1:
                 earlier = row_nums[:-1]
-                print(
-                    f"[INFO] '{ws_name}': lead {lid} has {len(row_nums)} duplicate rows "
-                    f"— removing earlier occurrence(s) at row(s) {earlier}, keeping row {row_nums[-1]}"
+                _log_lead.warning(
+                    "SHEET '%s': lead %s has %d duplicate rows — removing rows %s, keeping row %d",
+                    ws_name, lid, len(row_nums), earlier, row_nums[-1],
                 )
                 to_delete.update(earlier)
 
@@ -784,7 +856,7 @@ class SheetSync:
         for row_num in sorted(to_delete, reverse=True):
             ws.delete_rows(row_num)
 
-        print(f"[INFO] '{ws_name}': purged {len(to_delete)} duplicate lead row(s) successfully.")
+        _log_lead.info("SHEET '%s': purged %d duplicate lead row(s).", ws_name, len(to_delete))
 
         # Return a cleaned list (keeps rows whose 1-based index is NOT in to_delete)
         return [row for i, row in enumerate(all_vals) if (i + 1) not in to_delete]
@@ -838,6 +910,7 @@ class SheetSync:
             row_num = row_idx.get(lead_id)
             if row_num:
                 ws.update(values=[row_data], range_name=f"A{row_num}")
+                _log_lead.info("SHEET UPDATE row=%d lead=%s tab='%s'", row_num, lead_id, ws_name)
                 return row_num
 
             # Use append_rows instead of a position-specific update so that the row
@@ -864,6 +937,7 @@ class SheetSync:
             # Keep index consistent
             row_idx[lead_id] = actual_row
             self._row_count[ws_name] = actual_row
+            _log_lead.info("SHEET INSERT row=%d lead=%s tab='%s'", actual_row, lead_id, ws_name)
             # Apply a dropdown to the status cell of the new row
             status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
             self._apply_status_dropdown(ws, f"{status_col_letter}{actual_row}:{status_col_letter}{actual_row}")
@@ -874,9 +948,11 @@ class SheetSync:
         with self.lock:
             row_num = self.find_row(ws, lead_id)
             if not row_num:
+                _log_lead.warning("SHEET STATUS — lead %s not found in tab '%s'", lead_id, tab_name)
                 return
             col = STATUS_COL_INDEX + 1
             ws.update_cell(row_num, col, status_name)
+            _log_lead.info("SHEET STATUS lead=%s → '%s' (row=%d tab='%s')", lead_id, status_name, row_num, ws.title)
 
     def iter_lead_statuses(self) -> List[Dict[str, str]]:
         """Iterate statuses across ALL monthly worksheets.
@@ -891,7 +967,7 @@ class SheetSync:
             self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
             all_titles = [ws.title for ws in self.spreadsheet.worksheets()]
         except Exception as exc:
-            print(f"[WARN] iter_lead_statuses: could not list worksheets: {exc}")
+            _log.warning("iter_lead_statuses: could not list worksheets: %s", exc)
             return out
 
         month_pattern = re.compile(r'^\d{2}\.\d{4}$')  # e.g. "03.2026"
@@ -917,7 +993,7 @@ class SheetSync:
                             "tab_name": tab_name,
                         })
             except Exception as exc:
-                print(f"[WARN] iter_lead_statuses: could not read tab '{tab_name}': {exc}")
+                _log.warning("iter_lead_statuses: could not read tab '%s': %s", tab_name, exc)
         return out
 
 
@@ -1066,7 +1142,7 @@ class SyncService:
             tz_offset=self.cfg.DISPLAY_TZ_OFFSET,
             dumka_recovery_days=int(os.getenv("DUMKA_RECOVERY_DAYS", "5")),
         )
-        print(f"[KPI] Store initialised at {_kpi_db}")
+        _log.info("KPI store initialised at %s", _kpi_db)
 
     def _is_duplicate_webhook(self, lead_id: str, status_id: int) -> bool:
         """Return True if this (lead_id, status_id) was already processed within WEBHOOK_DEDUP_TTL_SEC.
@@ -1092,18 +1168,18 @@ class SyncService:
             for u in users:
                 self.users_map[u["id"]] = u["name"]
         except Exception as exc:
-            print(f"[WARN] Could not load users: {exc}")
+            _log.warning("Could not load users: %s", exc)
 
     def _load_structure_mappings(self) -> None:
         try:
             data = self.amo.get("/api/v4/leads/pipelines?with=statuses&limit=250")
             pipelines = data.get("_embedded", {}).get("pipelines", [])
         except Exception as exc:
-            print(f"[WARN] Could not load amo structure, falling back to .env IDs: {exc}")
+            _log.warning("Could not load AMO structure, falling back to .env IDs: %s", exc)
             if "refresh token" in str(exc).lower() or "token" in str(exc).lower():
-                print("[INFO] Complete OAuth first via POST /oauth/exchange, then restart service.")
+                _log.info("Complete OAuth first via POST /oauth/exchange, then restart service.")
                 if self.cfg.AMO_CLIENT_ID and self.cfg.AMO_REDIRECT_URI:
-                    print(f"[INFO] Open auth URL: {self.amo.auth_url()}")
+                    _log.info("Open auth URL: %s", self.amo.auth_url())
             pipelines = []
 
         for pipeline in pipelines:
@@ -1116,8 +1192,10 @@ class SyncService:
             # (loaded at module level) take precedence because they were applied first.
             if pipeline_raw_name and pipeline_raw_name not in PIPELINE_DISPLAY_MAP:
                 PIPELINE_DISPLAY_MAP[pipeline_raw_name] = pipeline_raw_name
-                print(f"[INFO] Pipeline auto-registered: '{pipeline_raw_name}' "
-                      f"(set PIPELINE_DISPLAY_MAP_JSON to customise display name)")
+                _log.info(
+                    "Pipeline auto-registered: '%s' (set PIPELINE_DISPLAY_MAP_JSON to customise)",
+                    pipeline_raw_name,
+                )
 
             statuses = pipeline.get("_embedded", {}).get("statuses", [])
             if pipeline_id not in self.pipeline_status_name_to_id:
@@ -1167,13 +1245,13 @@ class SyncService:
 
     def _print_config_warnings(self) -> None:
         if not self.trigger_status_ids:
-            print("[WARN] No trigger status IDs resolved. Leads will NOT be added from webhook.")
+            _log.warning("No trigger status IDs resolved. Leads will NOT be added from webhook.")
         if self.cfg.PIPELINE_ID == 0:
-            print("[WARN] PIPELINE_ID is 0. Service will try to use each lead's current pipeline dynamically.")
+            _log.warning("PIPELINE_ID is 0. Service will use each lead's current pipeline dynamically.")
         zero_terminal = [name for name, sid in self.cfg.STATUS_MAP.items() if not sid]
         if zero_terminal:
-            print(f"[WARN] Terminal status IDs are not configured: {zero_terminal}")
-        print(f"[INFO] Resolved trigger status IDs: {sorted(self.trigger_status_ids)}")
+            _log.warning("Terminal status IDs are not configured: %s", zero_terminal)
+        _log.info("Resolved trigger status IDs: %s", sorted(self.trigger_status_ids))
 
     def _load_state(self) -> Dict[str, Dict[str, str]]:
         if self.state_path.exists():
@@ -1196,16 +1274,22 @@ class SyncService:
 
     def remember_sheet_status(self, lead_id: str, status_name: str) -> None:
         with self.state_lock:
+            prev = self.state.get("sheet_status_by_lead", {}).get(str(lead_id), "")
             self.state.setdefault("sheet_status_by_lead", {})[str(lead_id)] = status_name
             self._state_dirty = True
+        if prev != status_name:
+            _log_lead.info("LEAD %s status tracked: '%s' → '%s'", lead_id, prev or "(new)", status_name)
 
     def get_known_sheet_status(self, lead_id: str) -> str:
         return self.state.get("sheet_status_by_lead", {}).get(str(lead_id), "")
 
     def remember_sheet_order_number(self, lead_id: str, order_number: str) -> None:
         with self.state_lock:
+            prev = self.state.get("sheet_order_number_by_lead", {}).get(str(lead_id))
             self.state.setdefault("sheet_order_number_by_lead", {})[str(lead_id)] = order_number
             self._state_dirty = True
+        if prev is not None and prev != order_number and order_number:
+            _log_lead.info("LEAD %s order# tracked: '%s' → '%s'", lead_id, prev, order_number)
 
     def get_known_order_number(self, lead_id: str) -> str:
         return self.state.get("sheet_order_number_by_lead", {}).get(str(lead_id), "")
@@ -1234,11 +1318,12 @@ class SyncService:
         """Remove all tracking data for a lead (called when its lifetime ends)."""
         lid = str(lead_id)
         with self.state_lock:
-            self.state.get("sheet_status_by_lead",       {}).pop(lid, None)
+            prev_status = self.state.get("sheet_status_by_lead", {}).pop(lid, None)
             self.state.get("sheet_order_number_by_lead", {}).pop(lid, None)
             self.state.get("lead_expiry",                {}).pop(lid, None)
             self.state.get("lead_tab_by_lead",           {}).pop(lid, None)
             self._state_dirty = True
+        _log_lead.info("LEAD %s forgotten (last status='%s')", lead_id, prev_status or "?")
 
     def expire_finished_leads(self) -> None:
         """Purge leads whose monitoring window has elapsed. Called from the worker loop."""
@@ -1248,7 +1333,7 @@ class SyncService:
             if now >= ts
         ]
         for lid in expired:
-            print(f"[INFO] Lead {lid} monitoring lifetime ended — removing from tracking.")
+            _log_lead.info("LEAD %s monitoring window expired — removing from tracking.", lid)
             self.forget_lead(lid)
         if expired:
             self.flush_state()
@@ -1257,7 +1342,13 @@ class SyncService:
         """If status_display has a configured lifetime, start (or overwrite) the countdown."""
         seconds = self._EXPIRY_SECONDS.get(status_display)
         if seconds is not None:
-            self.remember_lead_expiry(lead_id, time.time() + seconds)
+            expiry_ts = time.time() + seconds
+            self.remember_lead_expiry(lead_id, expiry_ts)
+            expiry_str = datetime.fromtimestamp(expiry_ts).strftime("%Y-%m-%d %H:%M:%S")
+            _log_lead.info(
+                "LEAD %s expiry set: status='%s' — will be forgotten at %s (in %dh)",
+                lead_id, status_display, expiry_str, seconds // 3600,
+            )
 
     def _tab_for_lead(self, lead: Dict[str, Any]) -> str:  # noqa: ARG002
         """Return the active worksheet name for new lead writes.
@@ -1302,14 +1393,14 @@ class SyncService:
         Called once on startup when INITIAL_SYNC_DATE_FROM / INITIAL_SYNC_DATE_TO are set.
         Leads already present in the sheet are updated in-place; new ones are appended.
         """
-        print(f"[INFO] Initial sync: fetching AMO leads created {date_from} – {date_to} …")
+        _log.info("Initial sync: fetching AMO leads created %s – %s …", date_from, date_to)
         try:
             leads = self.amo.fetch_leads_by_date_range(date_from, date_to)
         except Exception as exc:
-            print(f"[ERROR] Initial sync failed to fetch leads: {exc}")
+            _log.error("Initial sync failed to fetch leads: %s", exc)
             return
 
-        print(f"[INFO] Initial sync: {len(leads)} lead(s) returned from AMO.")
+        _log.info("Initial sync: %d lead(s) returned from AMO.", len(leads))
         staff_mapping = self.sheet.get_staff_mapping()
         written = 0
         skipped = 0
@@ -1353,7 +1444,7 @@ class SyncService:
             written += 1
 
         self.flush_state()  # Persist all initial sync state in one write
-        print(f"[INFO] Initial sync complete: {written} written, {skipped} skipped.")
+        _log.info("Initial sync complete: %d written, %d skipped.", written, skipped)
 
     def check_and_rotate_sheet(self) -> None:
         """Archive the active worksheet when the month rolls over.
@@ -1392,21 +1483,21 @@ class SyncService:
             try:
                 self.sheet._get_or_create_month_sheet(main_name)
             except Exception as exc:
-                print(f"[WARN] Could not ensure active tab '{main_name}': {exc}")
+                _log.warning("Could not ensure active tab '%s': %s", main_name, exc)
             with self.state_lock:
                 self.state["active_sheet_month"] = current_month
             self._save_state()
-            print(f"[INFO] Sheet rotation initialised: current month = '{current_month}'")
+            _log.info("Sheet rotation initialised: current month = '%s'", current_month)
             return
 
         # Month has rolled over — archive Sheet1 under the old month's name
         archive_name = known_key  # e.g. "02.2026"
-        print(f"[INFO] Month changed '{known_key}' → '{current_month}': "
-              f"archiving '{main_name}' as '{archive_name}'")
+        _log.info("Month changed '%s' → '%s': archiving '%s' as '%s'",
+                  known_key, current_month, main_name, archive_name)
         try:
             self.sheet.rotate_to_archive(archive_name)
         except Exception as exc:
-            print(f"[ERROR] Sheet rotation failed: {exc}")
+            _log.error("Sheet rotation failed: %s", exc)
             return
 
         # Update lead_tab_by_lead: every lead that was on "Sheet1" is now on the
@@ -1421,8 +1512,8 @@ class SyncService:
             if updated:
                 self._state_dirty = True
         if updated:
-            print(f"[INFO] Updated tab pointer for {updated} lead(s): "
-                  f"'{main_name}' → '{archive_name}'")
+            _log.info("Updated tab pointer for %d lead(s): '%s' → '%s'",
+                      updated, main_name, archive_name)
 
         with self.state_lock:
             self.state["active_sheet_month"] = current_month
@@ -1479,20 +1570,20 @@ class SyncService:
                         lead_id, staff_code, None, pipeline_name, budget
                     )
                     if ok:
-                        print(f"[KPI] consul  lead={lead_id} staff={staff_code}")
+                        _log.info("KPI consul  lead=%s staff=%s", lead_id, staff_code)
 
             elif display_name in KPI_ZAKAS_DISPLAY_NAMES:
                 ok = self.kpi_store.record_zakas(lead_id, None, budget, pipeline_name)
                 if ok:
-                    print(f"[KPI] zakas   lead={lead_id}")
+                    _log.info("KPI zakas   lead=%s", lead_id)
 
             elif display_name in KPI_DUMKA_DISPLAY_NAMES:
                 ok = self.kpi_store.record_dumka(lead_id, None, pipeline_name)
                 if ok:
-                    print(f"[KPI] dumka   lead={lead_id}")
+                    _log.info("KPI dumka   lead=%s", lead_id)
 
         except Exception as exc:
-            print(f"[KPI] Error recording event for lead {lead_id}: {exc}")
+            _log.error("KPI error recording event for lead %s: %s", lead_id, exc)
 
     def run_kpi_backfill(self, date_from: str, date_to: str) -> Dict[str, int]:
         """Replay AMO events for the given date range and populate the KPI store."""
@@ -1555,11 +1646,13 @@ class SyncService:
             # Deduplicate: amoCRM retries webhooks — skip if we already handled this exact event
             if self._is_duplicate_webhook(lead_id, webhook_status_id):
                 skipped_duplicate += 1
+                _log_wh.debug("WEBHOOK lead=%s status_id=%d — duplicate, skipped", lead_id, webhook_status_id)
                 continue
 
             # Skip leads whose monitoring lifetime has ended
             if self.is_lead_expired(lead_id):
                 skipped_status_mismatch += 1
+                _log_wh.debug("WEBHOOK lead=%s status_id=%d — expired, skipped", lead_id, webhook_status_id)
                 continue
 
             is_trigger = webhook_status_id in self.trigger_status_ids
@@ -1568,6 +1661,10 @@ class SyncService:
 
             if not (is_trigger or is_terminal or known_status):
                 skipped_status_mismatch += 1
+                _log_wh.debug(
+                    "WEBHOOK lead=%s status_id=%d — not trigger/terminal/known, skipped",
+                    lead_id, webhook_status_id,
+                )
                 continue
 
             # Fetch the absolute latest state from AmoCRM to avoid race conditions
@@ -1589,6 +1686,7 @@ class SyncService:
                 updated_at = int(full_lead.get("updated_at", 0) or 0)
                 if updated_at and updated_at < self.cfg.LEADS_CREATED_AFTER:
                     skipped_too_old += 1
+                    _log_wh.debug("WEBHOOK lead=%s — updated_at too old (%d), skipped", lead_id, updated_at)
                     continue
 
             # Skip leads from pipelines not matching the keyword filter.
@@ -1596,6 +1694,10 @@ class SyncService:
                 wh_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 wh_pipeline_name = self.pipeline_id_to_name.get(wh_pipeline_id, "")
                 if self.cfg.PIPELINE_KEYWORD not in wh_pipeline_name.lower():
+                    _log_wh.debug(
+                        "WEBHOOK lead=%s pipeline='%s' — keyword filter mismatch, skipped",
+                        lead_id, wh_pipeline_name,
+                    )
                     continue
 
             if status_id in self.trigger_status_ids:
@@ -1604,17 +1706,21 @@ class SyncService:
                 pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
                 pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
                 pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
-                
+
                 responsible_id = int(full_lead.get("responsible_user_id", 0) or 0)
                 responsible_name = self.users_map.get(responsible_id, str(responsible_id))
-                
+
                 current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
-                
+
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
                 self.sheet.upsert_row(row, tab_name)
                 self.remember_sheet_status(lead_id, current_status_name)
                 self.remember_lead_tab(lead_id, tab_name)
+                _log_wh.info(
+                    "WEBHOOK TRIGGER lead=%s pipeline='%s' status='%s' → written to sheet tab='%s'",
+                    lead_id, pipeline_name, current_status_name, tab_name,
+                )
                 # Preserve any Заказ № already stored in AMO so that if a lead returns
                 # to the trigger status after the order number was filled, we do NOT
                 # reset known_order to "" and accidentally re-trigger the Заказ № push.
@@ -1635,10 +1741,18 @@ class SyncService:
                 # "У курера".  Sheet must stay "В процессе" until operator changes it manually.
                 if sheet_display == "У курера" and known_status == "В процессе":
                     skipped_status_mismatch += 1
+                    _log_wh.debug(
+                        "WEBHOOK TERMINAL lead=%s status='%s' — suppressed (У курера while В процессе)",
+                        lead_id, terminal_name,
+                    )
                     continue
                 self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                 self.remember_sheet_status(lead_id, sheet_display)
                 self._set_expiry_for_status(lead_id, sheet_display)
+                _log_wh.info(
+                    "WEBHOOK TERMINAL lead=%s amo_status='%s' → sheet='%s'",
+                    lead_id, terminal_name, sheet_display,
+                )
                 written += 1
             else:
                 if known_status:
@@ -1652,12 +1766,23 @@ class SyncService:
                     self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                     self.remember_sheet_status(lead_id, sheet_display)
                     self._set_expiry_for_status(lead_id, sheet_display)
+                    _log_wh.info(
+                        "WEBHOOK STATUS lead=%s amo_status_id=%d → sheet='%s'",
+                        lead_id, status_id, sheet_display,
+                    )
                     written += 1
                 else:
                     skipped_status_mismatch += 1
+                    _log_wh.debug("WEBHOOK lead=%s status_id=%d — not known/tracked, skipped", lead_id, status_id)
 
         # Flush all state mutations accumulated during this batch in one disk write
         self.flush_state()
+        _log_wh.info(
+            "WEBHOOK BATCH done: received=%d written=%d triggers=%d terminals=%d "
+            "skip_dup=%d skip_old=%d skip_mismatch=%d",
+            len(leads), written, trigger_matches, terminal_matches,
+            skipped_duplicate, skipped_too_old, skipped_status_mismatch,
+        )
         return {
             "received": len(leads),
             "written": written,
@@ -1672,8 +1797,37 @@ class SyncService:
             "configured_terminal_status_ids": self.cfg.STATUS_MAP,
         }
 
+    def _detect_deleted_rows(self, visible_ids: set) -> None:
+        """Compare leads we track in state against what is visible in the sheet.
+
+        Any lead that our service wrote (has an entry in lead_tab_by_lead) but is
+        no longer present in ANY scanned tab is considered externally deleted.
+        We log a warning with all known details and immediately forget the lead so
+        this message appears exactly once (not on every subsequent poll cycle).
+        """
+        with self.state_lock:
+            tracked = dict(self.state.get("lead_tab_by_lead", {}))
+        for lead_id, tab in tracked.items():
+            if lead_id in visible_ids:
+                continue
+            # Skip leads that have already passed their expiry — expire_finished_leads
+            # will handle those in its own loop.
+            if self.is_lead_expired(lead_id):
+                continue
+            known_status = self.get_known_sheet_status(lead_id)
+            _log_lead.warning(
+                "SHEET ROW DELETED externally — lead=%s was in tab='%s' (last known status='%s')"
+                " — row is no longer present in the sheet",
+                lead_id, tab, known_status or "?",
+            )
+            # Forget immediately so this warning fires exactly once, not every poll.
+            self.forget_lead(lead_id)
+        self.flush_state()
+
     def sync_sheet_to_amo(self) -> None:
         rows = self.sheet.iter_lead_statuses()
+        visible_ids = {item["lead_id"] for item in rows}
+        self._detect_deleted_rows(visible_ids)
         for item in rows:
             lead_id = item["lead_id"]
             status_name = item["status"]
@@ -1712,15 +1866,21 @@ class SyncService:
                                 ],
                             },
                         )
-                        print(f"[INFO] Lead {lead_id}: Заказ № filled ('{order_number}') → set in AMO + moved to Заказ отправлен")
+                        _log_lead.info(
+                            "LEAD %s order# filled ('%s') → AMO PATCH sent (status_id=%d pipeline=%d)",
+                            lead_id, order_number, status_id, lead_pipeline_id,
+                        )
                         # Remember ONLY after a successful PATCH — if status_id was
                         # not found we must NOT update state so the trigger retries
                         # on the next poll cycle (after a service restart or fix).
                         self.remember_sheet_order_number(lead_id, order_number)
                     else:
-                        print(f"[WARN] Lead {lead_id}: Заказ № filled but could not find 'Заказ отправлен' status ID for pipeline {lead_pipeline_id}")
+                        _log_lead.warning(
+                            "LEAD %s order# filled ('%s') but no 'Заказ отправлен' status ID found for pipeline %d",
+                            lead_id, order_number, lead_pipeline_id,
+                        )
                 except Exception as exc:
-                    print(f"Failed to move lead {lead_id} to Заказ отправлен: {exc}")
+                    _log.error("Failed to push order# for lead %s: %s", lead_id, exc)
 
             # ── Status trigger: sheet status changed → push to AMO ──
             if status_name not in self.cfg.STATUS_MAP:
@@ -1744,7 +1904,10 @@ class SyncService:
                     status_id = self.cfg.STATUS_MAP.get(amo_lookup)
 
                 if not status_id:
-                    print(f"No status ID mapping for lead {lead_id}, status '{status_name}', pipeline {lead_pipeline_id}")
+                    _log.warning(
+                        "No status ID mapping for lead %s, sheet status '%s', pipeline %d",
+                        lead_id, status_name, lead_pipeline_id,
+                    )
                     continue
 
                 self.amo.patch(
@@ -1756,7 +1919,7 @@ class SyncService:
                 )
                 self.remember_sheet_status(lead_id, status_name)
             except Exception as exc:
-                print(f"Failed to sync sheet->amo for lead {lead_id}: {exc}")
+                _log.error("Failed to sync sheet→amo for lead %s: %s", lead_id, exc)
         # One disk write for all status updates in this poll cycle
         self.flush_state()
 
@@ -1826,7 +1989,7 @@ def on_startup() -> None:
                 service.cfg.INITIAL_SYNC_DATE_TO,
             )
         except Exception as exc:
-            print(f"[ERROR] Initial date-range sync failed: {exc}")
+            _log.error("Initial date-range sync failed: %s", exc)
 
     # Retry bootstrap on Sheets quota errors (429)
     for attempt in range(1, 6):
@@ -1837,7 +2000,7 @@ def on_startup() -> None:
             msg = str(exc)
             if "429" in msg or "Quota exceeded" in msg:
                 wait = attempt * 30
-                print(f"[WARN] Sheets quota hit during bootstrap (attempt {attempt}), retrying in {wait}s...")
+                _log.warning("Sheets quota hit during bootstrap (attempt %d), retrying in %ds...", attempt, wait)
                 time.sleep(wait)
             else:
                 raise
@@ -1852,10 +2015,10 @@ def on_startup() -> None:
                 backoff = 0
             except Exception as exc:
                 msg = str(exc)
-                print(f"Sheet sync worker error: {msg}")
+                _log.error("Sheet sync worker error: %s", msg)
                 if "429" in msg or "Quota exceeded" in msg:
                     backoff = min(backoff + 60, 300)
-                    print(f"[WARN] Sheets quota hit — backing off {backoff}s")
+                    _log.warning("Sheets quota hit — backing off %ds", backoff)
                     time.sleep(backoff)
                     continue
             time.sleep(service.cfg.SYNC_POLL_SECONDS)
@@ -1870,12 +2033,12 @@ def on_startup() -> None:
             try:
                 from datetime import date as _date
                 today_str = _date.today().strftime("%Y-%m-%d")
-                print(f"[KPI] Starting backfill {kpi_backfill_date} → {today_str} …")
+                _log.info("KPI backfill starting: %s → %s", kpi_backfill_date, today_str)
                 counts = service.run_kpi_backfill(kpi_backfill_date, today_str)
                 service.kpi_store.mark_backfill_done(kpi_backfill_date, today_str)
-                print(f"[KPI] Backfill complete: {counts}")
+                _log.info("KPI backfill complete: %s", counts)
             except Exception as _exc:
-                print(f"[ERROR] KPI backfill failed: {_exc}")
+                _log.error("KPI backfill failed: %s", _exc)
         threading.Thread(target=_run_backfill, daemon=True).start()
 
 
