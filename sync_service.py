@@ -664,9 +664,10 @@ class SheetSync:
                 ws.freeze(rows=1)
                 # Header changed — row index is stale
                 self._invalidate_row_index(name)
-            # Apply dropdown validation to the entire status column (rows 2-2000)
-            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-            self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
+                # Apply dropdown only when creating/resetting the sheet so we
+                # don't overwrite existing Google Sheets validation on every restart.
+                status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+                self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
                 
         self._sheets[name] = ws
         return ws
@@ -692,9 +693,10 @@ class SheetSync:
             ws.update(values=[COLUMNS], range_name="A1")
             ws.freeze(rows=1)
             self._invalidate_row_index(tab_name)
-        # Apply dropdown validation to the entire status column (rows 2-2000)
-        status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-        self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
+            # Apply dropdown only when creating/resetting the sheet so we
+            # don't overwrite existing Google Sheets validation on every restart.
+            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+            self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
         self._sheets[tab_name] = ws
         return ws
 
@@ -1400,15 +1402,47 @@ class SyncService:
         tab = self.state.get("lead_tab_by_lead", {}).get(str(lead_id), "")
         return tab if tab else self.cfg.GOOGLE_WORKSHEET_NAME
 
+    # Set of display names considered valid for sheet status cells.
+    _VALID_DISPLAY_STATUSES: frozenset = frozenset(STATUS_DISPLAY_MAP.values()) | frozenset(
+        ["В процессе", "У курера", "Успешно", "Отказ", "Неразобранное",
+         "Закрыто и не реализовано"]
+    )
+
     def bootstrap_sheet_state(self) -> None:
         rows = self.sheet.iter_lead_statuses()
         for item in rows:
-            self.remember_sheet_status(item["lead_id"], item["status"])
+            raw_status = item["status"]
+            lead_id    = item["lead_id"]
+            tab        = item.get("tab_name", "")
+
+            # ── Heal stale / raw status names written before normalization was in place ──
+            # If the cell contains a raw AMO status name (e.g. "заказ отпрAвлен" with
+            # a Latin A, written by an older version of the service), correct it now
+            # by looking it up through the same normalised map used at runtime.
+            healed_status = raw_status
+            if raw_status and raw_status not in self._VALID_DISPLAY_STATUSES:
+                normalized = _normalize_amo_name(raw_status)
+                candidate = (
+                    STATUS_DISPLAY_MAP.get(raw_status)
+                    or _STATUS_DISPLAY_NORMALIZED.get(normalized)
+                )
+                if candidate and candidate != raw_status:
+                    _log_lead.warning(
+                        "BOOTSTRAP heal: lead=%s tab='%s' cell status '%s' → corrected to '%s'",
+                        lead_id, tab, raw_status, candidate,
+                    )
+                    try:
+                        self.sheet.update_status(lead_id, candidate, tab)
+                    except Exception as exc:
+                        _log.warning("BOOTSTRAP heal failed for lead %s: %s", lead_id, exc)
+                    healed_status = candidate
+
+            self.remember_sheet_status(lead_id, healed_status)
             # Snapshot the current order number so we can detect when it gets filled
-            self.remember_sheet_order_number(item["lead_id"], item.get("order_number", ""))
+            self.remember_sheet_order_number(lead_id, item.get("order_number", ""))
             # Record which tab each lead lives on (used by update_status routing)
-            if item.get("tab_name"):
-                self.remember_lead_tab(item["lead_id"], item["tab_name"])
+            if tab:
+                self.remember_lead_tab(lead_id, tab)
         self.flush_state()  # Persist bootstrapped state in one write
 
     def initial_sync_leads(self, date_from: str, date_to: str) -> None:
