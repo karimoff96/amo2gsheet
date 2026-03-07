@@ -1909,14 +1909,14 @@ class SyncService:
                         lead_id, terminal_name,
                     )
                     continue
-                # When admin sets "У курера" on the sheet → script PATCHes AMO to
-                # "Успешно реализовано" → AMO fires webhook back with that status →
-                # maps to "Успешно".  Sheet must stay "У курера" — "Успешно" is
-                # display-only and must never overwrite an explicit operator choice.
-                if sheet_display == "Успешно" and known_status == "У курера":
+                # "Успешно" is display-only for staff and must NEVER be written to the
+                # sheet by an incoming webhook.  The sheet already reflects what the
+                # operator chose ("У курера", "В процессе", etc.) and that must be
+                # preserved regardless of what AMO echoes back.
+                if sheet_display == "Успешно":
                     skipped_status_mismatch += 1
                     _log_wh.debug(
-                        "WEBHOOK TERMINAL lead=%s status='%s' — suppressed (Успешно while У курера)",
+                        "WEBHOOK TERMINAL lead=%s status='%s' — suppressed (Успешно is display-only)",
                         lead_id, terminal_name,
                     )
                     continue
@@ -1937,8 +1937,8 @@ class SyncService:
                     if sheet_display == "У курера" and known_status == "В процессе":
                         skipped_status_mismatch += 1
                         continue
-                    # Same suppression: Успешно реализовано webhook must not overwrite "У курера"
-                    if sheet_display == "Успешно" and known_status == "У курера":
+                    # "Успешно" is display-only — never write it to the sheet from a webhook.
+                    if sheet_display == "Успешно":
                         skipped_status_mismatch += 1
                         continue
                     self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))

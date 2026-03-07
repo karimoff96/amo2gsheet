@@ -41,10 +41,10 @@ AMO status name → sheet display name (via `STATUS_DISPLAY_MAP`):
 
 **Suppression rules (webhook → sheet update is blocked when):**
 
-| Incoming AMO status → sheet value | Current sheet status | Reason |
+| Incoming AMO status → sheet value | Condition | Reason |
 |---|---|---|
-| `ЗАКАЗ ОТПРАВЛЕН` → `У курера` | `В процессе` | Order-fill webhook must not overwrite В процессе before admin advances it |
-| `Успешно реализовано` → `Успешно` | `У курера` | Admin set У курера → script PATCHed AMO → AMO echoes back Успешно реализовано; sheet must stay У курера |
+| `ЗАКАЗ ОТПРАВЛЕН` → `У курера` | sheet is `В процессе` | Order-fill webhook must not overwrite В процессе before admin advances it |
+| Any AMO status → `Успешно` | **always** | `Успешно` is display-only for staff — the webhook handler **never** writes it to the sheet |
 
 ---
 
