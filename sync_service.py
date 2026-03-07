@@ -1073,7 +1073,7 @@ def build_row(lead: Dict[str, Any], status_name: str, pipeline_name: str = "", r
         for cf in contact.get("custom_fields_values") or []:
             if cf.get("field_code") == "PHONE" or cf.get("field_name", "").upper() in ("PHONE", "ТЕЛЕФОН"):
                 for v in cf.get("values") or []:
-                    num = str(v.get("value", "")).strip()
+                    num = str(v.get("value", "")).strip().lstrip("+")
                     if num and num not in _phone_seen:
                         _phone_seen.append(num)
     contact_phone = ", ".join(_phone_seen)
