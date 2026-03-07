@@ -25,3 +25,5 @@ data.xlsx
 _debug_*.py
 _debug_*.txt
 _debug_*.json
+logs/
+data/
