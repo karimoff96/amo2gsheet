@@ -1909,6 +1909,17 @@ class SyncService:
                         lead_id, terminal_name,
                     )
                     continue
+                # When admin sets "У курера" on the sheet → script PATCHes AMO to
+                # "Успешно реализовано" → AMO fires webhook back with that status →
+                # maps to "Успешно".  Sheet must stay "У курера" — "Успешно" is
+                # display-only and must never overwrite an explicit operator choice.
+                if sheet_display == "Успешно" and known_status == "У курера":
+                    skipped_status_mismatch += 1
+                    _log_wh.debug(
+                        "WEBHOOK TERMINAL lead=%s status='%s' — suppressed (Успешно while У курера)",
+                        lead_id, terminal_name,
+                    )
+                    continue
                 self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                 self.remember_sheet_status(lead_id, sheet_display)
                 self.remember_lead_pipeline(lead_id, lead_pipeline_id)
@@ -1924,6 +1935,10 @@ class SyncService:
                     sheet_display      = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
                     # Same suppression: Заказ отправлен webhook must not overwrite "В процессе"
                     if sheet_display == "У курера" and known_status == "В процессе":
+                        skipped_status_mismatch += 1
+                        continue
+                    # Same suppression: Успешно реализовано webhook must not overwrite "У курера"
+                    if sheet_display == "Успешно" and known_status == "У курера":
                         skipped_status_mismatch += 1
                         continue
                     self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))

@@ -39,10 +39,12 @@ AMO status name → sheet display name (via `STATUS_DISPLAY_MAP`):
 | `ОТКАЗ` / `Отказ` | `Отказ` |
 | `Раздумье` | `Отказ` ← override via `AMO_STATUS_TO_SHEET_OVERRIDE` |
 
-**Suppression rule:** If AMO sends `ЗАКАЗ ОТПРАВЛЕН` (→ `У курера`) but the
-sheet currently shows `В процессе`, the update is **suppressed**.  This prevents
-the order-fill webhook from overwriting `В процессе` before the admin manually
-advances it.
+**Suppression rules (webhook → sheet update is blocked when):**
+
+| Incoming AMO status → sheet value | Current sheet status | Reason |
+|---|---|---|
+| `ЗАКАЗ ОТПРАВЛЕН` → `У курера` | `В процессе` | Order-fill webhook must not overwrite В процессе before admin advances it |
+| `Успешно реализовано` → `Успешно` | `У курера` | Admin set У курера → script PATCHed AMO → AMO echoes back Успешно реализовано; sheet must stay У курера |
 
 ---
 
