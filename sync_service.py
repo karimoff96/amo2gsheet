@@ -177,16 +177,19 @@ _STATUS_DISPLAY_LOWERED: Dict[str, str] = {
 ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
 
 # Maps what the user picks in Google Sheets → the AMO display name used for status ID lookup.
-# Both "У курера" and "Успешно" move the lead to the "Успешно реализовано" (won) step in AMO.
-# "Отказ" moves the lead to the pipeline's reject step.
+# See SYNC_LOGIC.md for the full rules. Key rules:
+#   "У курера"  (sheet) → "Успешно" lookup → resolves to AMO "Успешно реализовано" (won status).
+#   "Успешно"   (sheet) → NOT pushed to AMO at all — it is display-only for staff.
+#   "Отказ"     (sheet) → AMO reject step.
+#   "В процессе"(sheet) → AMO В процессе (rarely patched manually).
 SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
     "В процессе": "В процессе",
-    # "У курера" in the sheet means the order is with the courier — the matching
-    # AMO status is "ЗАКАЗ ОТПРАВЛЕН" (display name "У курера"), NOT
-    # "Успешно реализовано".  Using the display name here causes the reverse
-    # lookup in pipeline_status_display_to_id to resolve to the correct status ID.
-    "У курера":   "У курера",
-    "Успешно":    "Успешно",
+    # When admin sets "У курера" in the sheet the lead is considered delivered —
+    # move it to AMO "Успешно реализовано" (the won/closed status).  The lookup key
+    # "Успешно" resolves to that status via pipeline_status_display_to_id.
+    "У курера":   "Успешно",
+    # "Успешно" is intentionally absent — it must never be pushed to AMO.
+    # It is a display-only label that staff use to mark their own record keeping.
     "Отказ":      "Отказ",
 }
 
@@ -521,6 +524,34 @@ class AmoClient:
             _log_amo.error("GET %s failed: %d %s", endpoint, r.status_code, r.text[:200])
             raise RuntimeError(f"GET {endpoint} failed: {r.status_code} {r.text}")
         return r.json()
+
+    def batch_get_leads(self, lead_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Fetch multiple leads in one request. Returns {lead_id: lead_data}.
+
+        Uses filter[id][] to batch up to 50 leads per request, reducing per-lead
+        GET calls from N down to ceil(N/50).  Any chunk that fails is logged and
+        its IDs are simply absent from the result — callers fall back to the
+        original webhook payload for those leads.
+        """
+        if not lead_ids:
+            return {}
+        result: Dict[int, Dict[str, Any]] = {}
+        CHUNK = 50
+        for i in range(0, len(lead_ids), CHUNK):
+            chunk = lead_ids[i : i + CHUNK]
+            ids_param = "&".join(f"filter[id][]={lid}" for lid in chunk)
+            try:
+                data = self.get(
+                    f"/api/v4/leads?{ids_param}&with=contacts,companies&limit={CHUNK}"
+                )
+                for lead in (data.get("_embedded") or {}).get("leads") or []:
+                    result[int(lead["id"])] = lead
+            except Exception as exc:
+                _log_amo.error(
+                    "batch_get_leads chunk [%s] failed: %s",
+                    ",".join(map(str, chunk)), exc,
+                )
+        return result
 
     def fetch_leads_by_date_range(
         self, date_from: str, date_to: str
@@ -1406,6 +1437,18 @@ class SyncService:
         tab = self.state.get("lead_tab_by_lead", {}).get(str(lead_id), "")
         return tab if tab else self.cfg.GOOGLE_WORKSHEET_NAME
 
+    def remember_lead_pipeline(self, lead_id: str, pipeline_id: int) -> None:
+        """Cache the AMO pipeline_id so sync_sheet_to_amo can skip a GET per lead."""
+        if not pipeline_id:
+            return
+        with self.state_lock:
+            self.state.setdefault("lead_pipeline_by_lead", {})[str(lead_id)] = pipeline_id
+            self._state_dirty = True
+
+    def get_lead_pipeline(self, lead_id: str) -> int:
+        """Return cached pipeline_id or 0 if not yet stored."""
+        return int(self.state.get("lead_pipeline_by_lead", {}).get(str(lead_id), 0) or 0)
+
     # Set of display names considered valid for sheet status cells.
     _VALID_DISPLAY_STATUSES: frozenset = frozenset(STATUS_DISPLAY_MAP.values()) | frozenset(
         ["В процессе", "У курера", "Успешно", "Отказ", "Неразобранное",
@@ -1503,6 +1546,7 @@ class SyncService:
             self.sheet.upsert_row(row, tab_name)
             self.remember_sheet_status(lead_id, status_display)
             self.remember_lead_tab(lead_id, tab_name)
+            self.remember_lead_pipeline(lead_id, pipeline_id)
             self.remember_sheet_order_number(lead_id, "")
             written += 1
 
@@ -1599,6 +1643,46 @@ class SyncService:
         if enriched:
             lead.setdefault("_embedded", {})["contacts"] = enriched
         return lead
+
+    def _batch_enrich_contacts(self, leads: List[Dict[str, Any]]) -> None:
+        """Fetch contact details (phone etc.) for multiple leads in one batch request.
+
+        AMO embeds contacts in lead responses but omits custom_fields_values (phone).
+        This collects all contact IDs missing that data, fetches them in chunks of 50,
+        then updates each lead's embedded contacts in-place.
+        """
+        contact_ids: List[int] = []
+        for lead in leads:
+            for c in (lead.get("_embedded") or {}).get("contacts") or []:
+                cid = c.get("id")
+                if cid and not c.get("custom_fields_values") and cid not in contact_ids:
+                    contact_ids.append(cid)
+        if not contact_ids:
+            return
+
+        fetched: Dict[int, Dict[str, Any]] = {}
+        CHUNK = 50
+        for i in range(0, len(contact_ids), CHUNK):
+            chunk = contact_ids[i : i + CHUNK]
+            ids_param = "&".join(f"filter[id][]={cid}" for cid in chunk)
+            try:
+                data = self.amo.get(f"/api/v4/contacts?{ids_param}&limit={CHUNK}")
+                for contact in (data.get("_embedded") or {}).get("contacts") or []:
+                    fetched[int(contact["id"])] = contact
+            except Exception as exc:
+                _log.error("_batch_enrich_contacts chunk failed: %s", exc)
+
+        if not fetched:
+            return
+
+        for lead in leads:
+            contacts = (lead.get("_embedded") or {}).get("contacts") or []
+            enriched = [
+                fetched.get(int(c["id"]), c) if c.get("id") else c
+                for c in contacts
+            ]
+            if enriched:
+                lead.setdefault("_embedded", {})["contacts"] = enriched
 
     def _record_kpi_event(
         self, full_lead: Dict[str, Any], webhook_status_id: int
@@ -1697,6 +1781,13 @@ class SyncService:
 
         staff_mapping = self.sheet.get_staff_mapping()
 
+        # ── Pass 1: cheap local filtering — zero AMO API calls ────────────────────────────
+        # Collect every lead that actually needs processing.  All checks here use
+        # only local state so no network calls are made until the batch fetch below.
+        qualifying: List[Dict[str, Any]] = []   # original webhook payloads
+        wh_status_map: Dict[str, int] = {}       # lead_id → webhook_status_id
+        pre_known: Dict[str, str]      = {}       # lead_id → known sheet status (snapshot)
+
         for lead in leads:
             lead_id = str(lead.get("id", "")).strip()
             if not lead_id:
@@ -1718,7 +1809,7 @@ class SyncService:
                 _log_wh.debug("WEBHOOK lead=%s status_id=%d — expired, skipped", lead_id, webhook_status_id)
                 continue
 
-            is_trigger = webhook_status_id in self.trigger_status_ids
+            is_trigger  = webhook_status_id in self.trigger_status_ids
             is_terminal = str(webhook_status_id) in self.terminal_status_id_to_name
             known_status = self.get_known_sheet_status(lead_id)
 
@@ -1730,18 +1821,32 @@ class SyncService:
                 )
                 continue
 
-            # Fetch the absolute latest state from AmoCRM to avoid race conditions
-            try:
-                full_lead = self.amo.get(f"/api/v4/leads/{lead_id}?with=contacts,companies")
-                full_lead = self._enrich_lead_contacts(full_lead)
-                status_id = int(full_lead.get("status_id", 0) or 0)
-            except Exception:
+            qualifying.append(lead)
+            wh_status_map[lead_id] = webhook_status_id
+            pre_known[lead_id]     = known_status
+
+        # ── Batch fetch: ceil(N/50) lead GETs + ceil(C/50) contact GETs ───────────────
+        # For a bulk of N qualifying leads this replaces N individual lead GETs
+        # and N individual contact GETs with at most 2×ceil(N/50) requests.
+        qualifying_ids  = [int(lead["id"]) for lead in qualifying]
+        full_leads_map  = self.amo.batch_get_leads(qualifying_ids)
+        self._batch_enrich_contacts(list(full_leads_map.values()))
+
+        # ── Pass 2: business logic — all data already in memory ──────────────────────
+        for lead in qualifying:
+            lead_id           = str(lead["id"])
+            webhook_status_id = wh_status_map[lead_id]
+            known_status      = pre_known[lead_id]
+
+            full_lead = full_leads_map.get(int(lead_id))
+            if full_lead is None:
+                # Batch fetch failed for this lead — fall back to webhook payload
                 full_lead = lead
                 status_id = webhook_status_id
+            else:
+                status_id = int(full_lead.get("status_id", 0) or 0)
 
-            # ── KPI recording: record the transition indicated by the webhook ─
-            # Uses webhook_status_id (the event that triggered the webhook) so
-            # that we capture the transition that HAPPENED, not the current state.
+            # KPI recording uses webhook_status_id so we capture what HAPPENED
             self._record_kpi_event(full_lead, webhook_status_id)
 
             # Skip leads last updated before the configured cutoff (ignores stale history)
@@ -1754,7 +1859,7 @@ class SyncService:
 
             # Skip leads from pipelines not matching the keyword filter.
             if self.cfg.PIPELINE_KEYWORD:
-                wh_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
+                wh_pipeline_id   = int(full_lead.get("pipeline_id", 0) or 0)
                 wh_pipeline_name = self.pipeline_id_to_name.get(wh_pipeline_id, "")
                 if self.cfg.PIPELINE_KEYWORD not in wh_pipeline_name.lower():
                     _log_wh.debug(
@@ -1764,15 +1869,12 @@ class SyncService:
                     continue
 
             if status_id in self.trigger_status_ids:
-                trigger_matches += 1
-                trigger_display = STATUS_DISPLAY_MAP.get(self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME)
-                pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
-                pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
-                pipeline_display = PIPELINE_DISPLAY_MAP.get(pipeline_name, pipeline_name)
-
-                responsible_id = int(full_lead.get("responsible_user_id", 0) or 0)
-                responsible_name = self.users_map.get(responsible_id, str(responsible_id))
-
+                trigger_matches  += 1
+                trigger_display   = STATUS_DISPLAY_MAP.get(self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME)
+                pipeline_id       = int(full_lead.get("pipeline_id", 0) or 0)
+                pipeline_name     = self.pipeline_id_to_name.get(pipeline_id, "")
+                responsible_id    = int(full_lead.get("responsible_user_id", 0) or 0)
+                responsible_name  = self.users_map.get(responsible_id, str(responsible_id))
                 current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
 
                 tab_name = self._tab_for_lead(full_lead)
@@ -1780,6 +1882,7 @@ class SyncService:
                 self.sheet.upsert_row(row, tab_name)
                 self.remember_sheet_status(lead_id, current_status_name)
                 self.remember_lead_tab(lead_id, tab_name)
+                self.remember_lead_pipeline(lead_id, pipeline_id)
                 _log_wh.info(
                     "WEBHOOK TRIGGER lead=%s pipeline='%s' status='%s' → written to sheet tab='%s'",
                     lead_id, pipeline_name, current_status_name, tab_name,
@@ -1795,11 +1898,8 @@ class SyncService:
             terminal_name = self.terminal_status_id_to_name.get(str(status_id))
             if terminal_name:
                 terminal_matches += 1
-                lead_pipeline_id = int(full_lead.get("pipeline_id", 0) or 0)
-                p_name = self.pipeline_id_to_name.get(lead_pipeline_id, "")
-                p_display = PIPELINE_DISPLAY_MAP.get(p_name, p_name)
-                # Apply sheet override: e.g. AMO "Раздумье" → sheet "Отказ"
-                sheet_display = AMO_STATUS_TO_SHEET_OVERRIDE.get(terminal_name, terminal_name)
+                lead_pipeline_id  = int(full_lead.get("pipeline_id", 0) or 0)
+                sheet_display     = AMO_STATUS_TO_SHEET_OVERRIDE.get(terminal_name, terminal_name)
                 # When admin filled Заказ № → AMO moved to Заказ отправлен → webhook comes back as
                 # "У курера".  Sheet must stay "В процессе" until operator changes it manually.
                 if sheet_display == "У курера" and known_status == "В процессе":
@@ -1811,6 +1911,7 @@ class SyncService:
                     continue
                 self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                 self.remember_sheet_status(lead_id, sheet_display)
+                self.remember_lead_pipeline(lead_id, lead_pipeline_id)
                 self._set_expiry_for_status(lead_id, sheet_display)
                 _log_wh.info(
                     "WEBHOOK TERMINAL lead=%s amo_status='%s' → sheet='%s'",
@@ -1820,14 +1921,14 @@ class SyncService:
             else:
                 if known_status:
                     new_status_display = self.status_id_to_display_name.get(status_id, str(status_id))
-                    # Apply sheet override: e.g. AMO "Раздумье" → sheet "Отказ"
-                    sheet_display = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
+                    sheet_display      = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
                     # Same suppression: Заказ отправлен webhook must not overwrite "В процессе"
                     if sheet_display == "У курера" and known_status == "В процессе":
                         skipped_status_mismatch += 1
                         continue
                     self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
                     self.remember_sheet_status(lead_id, sheet_display)
+                    self.remember_lead_pipeline(lead_id, int(full_lead.get("pipeline_id", 0) or 0))
                     self._set_expiry_for_status(lead_id, sheet_display)
                     _log_wh.info(
                         "WEBHOOK STATUS lead=%s amo_status_id=%d → sheet='%s'",
@@ -1910,8 +2011,12 @@ class SyncService:
             order_was_tracked = str(lead_id) in self.state.get("sheet_order_number_by_lead", {})
             if order_was_tracked and not known_order and order_number and status_name == "В процессе":
                 try:
-                    lead = self.amo.get(f"/api/v4/leads/{lead_id}")
-                    lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
+                    lead_pipeline_id = self.get_lead_pipeline(lead_id)
+                    if not lead_pipeline_id:
+                        _p = self.amo.get(f"/api/v4/leads/{lead_id}")
+                        lead_pipeline_id = int(_p.get("pipeline_id", 0) or 0)
+                        if lead_pipeline_id:
+                            self.remember_lead_pipeline(lead_id, lead_pipeline_id)
                     status_id = self.pipeline_status_display_to_id.get(lead_pipeline_id, {}).get(ORDER_NUM_FILLED_AMO_STATUS_DISPLAY)
                     if not status_id:
                         status_id = self.pipeline_status_name_to_id.get(lead_pipeline_id, {}).get("Заказ отправлен")
@@ -1949,13 +2054,23 @@ class SyncService:
             if status_name not in self.cfg.STATUS_MAP:
                 continue
 
+            # "Успешно" is a display-only label for staff — never push it to AMO.
+            # (AMO itself writes "Успешно реализовано" which the webhook maps back to
+            # the "Успешно" display label; we must not reverse-patch that back.)
+            if status_name == "Успешно":
+                continue
+
             known = self.get_known_sheet_status(lead_id)
             if known == status_name:
                 continue
 
             try:
-                lead = self.amo.get(f"/api/v4/leads/{lead_id}")
-                lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
+                lead_pipeline_id = self.get_lead_pipeline(lead_id)
+                if not lead_pipeline_id:
+                    _p = self.amo.get(f"/api/v4/leads/{lead_id}")
+                    lead_pipeline_id = int(_p.get("pipeline_id", 0) or 0)
+                    if lead_pipeline_id:
+                        self.remember_lead_pipeline(lead_id, lead_pipeline_id)
 
                 # Translate the sheet status to the AMO display name we want to target
                 amo_lookup = SHEET_STATUS_TO_AMO_DISPLAY.get(status_name, status_name)
