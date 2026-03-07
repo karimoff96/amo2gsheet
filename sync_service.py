@@ -1331,10 +1331,7 @@ class SyncService:
     # When a lead reaches a terminal status we start a countdown. Once the
     # countdown expires every subsequent webhook for that lead is ignored and
     # the lead is removed from the state entirely.
-    _EXPIRY_SECONDS: Dict[str, int] = {
-        "Успешно": 12 * 3600,   # 12 hours
-        "Отказ":   24 * 3600,   # 24 hours
-    }
+    _EXPIRY_SECONDS: Dict[str, int] = {}
 
     def remember_lead_expiry(self, lead_id: str, expiry_ts: float) -> None:
         """Record the Unix timestamp at which we should stop tracking this lead."""
