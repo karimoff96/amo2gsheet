@@ -27,3 +27,4 @@ _debug_*.txt
 _debug_*.json
 logs/
 data/
+._diag_out.txt
