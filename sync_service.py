@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -2065,6 +2066,32 @@ class SyncService:
                 except Exception as exc:
                     _log.error("Failed to push order# for lead %s: %s", lead_id, exc)
 
+            # ── Order-number update/clear: Заказ № changed or erased → sync to AMO field ──
+            # This fires when the order number was already tracked (non-empty known_order)
+            # and the sheet value differs — covers both edits and clearing the cell.
+            elif order_was_tracked and known_order and known_order != order_number:
+                try:
+                    # AMO custom field 987889 accepts an empty string to clear the value.
+                    patch_value = order_number  # may be "" to clear
+                    self.amo.patch(
+                        f"/api/v4/leads/{lead_id}",
+                        {
+                            "custom_fields_values": [
+                                {
+                                    "field_id": 987889,
+                                    "values": [{"value": patch_value}],
+                                }
+                            ],
+                        },
+                    )
+                    _log_lead.info(
+                        "LEAD %s order# changed ('%s' → '%s') → AMO field updated",
+                        lead_id, known_order, order_number,
+                    )
+                    self.remember_sheet_order_number(lead_id, order_number)
+                except Exception as exc:
+                    _log.error("Failed to update order# for lead %s: %s", lead_id, exc)
+
             # ── Status trigger: sheet status changed → push to AMO ──
             if status_name not in self.cfg.STATUS_MAP:
                 continue
@@ -2089,6 +2116,12 @@ class SyncService:
 
                 # Translate the sheet status to the AMO display name we want to target
                 amo_lookup = SHEET_STATUS_TO_AMO_DISPLAY.get(status_name, status_name)
+
+                # When an operator moves a lead back to "В процессе" and the lead
+                # already has a Заказ №, it means the order was issued — push to
+                # ЗАКАЗ ОТПРАВЛЕН instead of ЗАКАЗ БЕЗ НУМЕРАЦИИ.
+                if status_name == "В процессе" and order_number:
+                    amo_lookup = ORDER_NUM_FILLED_AMO_STATUS_DISPLAY  # "У курера" → ЗАКАЗ ОТПРАВЛЕН
 
                 status_id = self.pipeline_status_display_to_id.get(lead_pipeline_id, {}).get(amo_lookup)
                 if not status_id:
@@ -2162,6 +2195,29 @@ class DashboardContext:
 
 service = SyncService()
 app = FastAPI(title="amoCRM <-> Google Sheets Sync")
+
+# ── Webhook processing queue ─────────────────────────────────────────────────
+# AMO disables webhooks when the endpoint doesn't respond within ~5 seconds.
+# We return 200 immediately and process leads asynchronously in this queue.
+_webhook_queue: queue.Queue = queue.Queue()
+
+
+def _webhook_worker() -> None:
+    """Background thread: drains _webhook_queue and processes each batch."""
+    while True:
+        try:
+            leads = _webhook_queue.get()
+            try:
+                service.process_webhook_leads(leads)
+            except Exception as exc:
+                _log.error("Webhook worker error: %s", exc)
+            finally:
+                _webhook_queue.task_done()
+        except Exception as exc:
+            _log.error("Webhook worker fatal error: %s", exc)
+
+
+threading.Thread(target=_webhook_worker, daemon=True, name="webhook-worker").start()
 
 # Mount staff KPI dashboard via a read-only DashboardContext facade
 # (dashboard_router never touches SheetSync write methods directly)
@@ -2350,8 +2406,10 @@ async def webhook_amocrm(request: Request) -> Dict[str, Any]:
     content_type = request.headers.get("content-type", "")
     payload = parse_payload(raw, content_type)
     leads = extract_leads(payload)
-    result = service.process_webhook_leads(leads)
-    return {"status": "ok", **result}
+    # Enqueue for async processing — return 200 immediately so AMO never
+    # marks this webhook as failed due to a slow response.
+    _webhook_queue.put(leads)
+    return {"status": "ok"}
 
 
 @app.post("/")
