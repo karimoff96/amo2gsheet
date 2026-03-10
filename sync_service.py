@@ -453,9 +453,10 @@ class AmoClient:
         return data["access_token"]
 
     def get_access_token(self) -> str:
-        # Re-use cached token for up to 5 minutes to avoid a /account ping before every call
+        # Re-use cached token for up to 23 hours — AMO tokens are valid for 24 h.
+        # The refresh_token path handles the rare case of an expired token.
         now = time.time()
-        if self._cached_access_token and now - self._token_validated_ts < 300:
+        if self._cached_access_token and now - self._token_validated_ts < 82800:
             return self._cached_access_token
 
         tokens = self._token_data()
@@ -683,6 +684,10 @@ class SheetSync:
         # calls are O(1) dict lookups with no additional Sheets API calls.
         self._row_index: Dict[str, Dict[str, int]] = {}
         self._row_count: Dict[str, int] = {}  # ws_name → last occupied row number
+        # Cache of worksheet titles — refreshed at most once every 120 s to avoid
+        # a metadata fetch on every poll cycle.
+        self._ws_titles_cache: List[str] = []
+        self._ws_titles_ts: float = 0.0
 
     def _get_or_create_sheet(self, name: str):
         if name in self._sheets:
@@ -998,26 +1003,35 @@ class SheetSync:
             ws.update_cell(row_num, col, status_name)
             _log_lead.info("SHEET STATUS lead=%s → '%s' (row=%d tab='%s')", lead_id, status_name, row_num, ws.title)
 
-    def iter_lead_statuses(self) -> List[Dict[str, str]]:
-        """Iterate statuses across ALL monthly worksheets.
+    def iter_lead_statuses(self, tabs_filter: Optional[set] = None) -> List[Dict[str, str]]:
+        """Iterate statuses across relevant monthly worksheets.
 
-        Scans every tab whose name matches the "MM.YYYY" pattern plus the
-        legacy GOOGLE_WORKSHEET_NAME tab (for backward compat during migration).
+        When ``tabs_filter`` is provided only the named tabs are scanned,
+        which avoids reading stale archived months on every poll cycle.
         Each returned dict includes a ``tab_name`` key so callers can record
         which sheet each lead lives on.
         """
         out: List[Dict[str, str]] = []
-        try:
-            self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
-            all_titles = [ws.title for ws in self.spreadsheet.worksheets()]
-        except Exception as exc:
-            _log.warning("iter_lead_statuses: could not list worksheets: %s", exc)
-            return out
+
+        # Refresh worksheet-titles list at most once every 120 s so we don't pay
+        # a metadata round-trip on every 60-second poll cycle.
+        now = time.time()
+        if not self._ws_titles_cache or now - self._ws_titles_ts > 120:
+            try:
+                self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+                self._ws_titles_cache = [ws.title for ws in self.spreadsheet.worksheets()]
+                self._ws_titles_ts = now
+            except Exception as exc:
+                _log.warning("iter_lead_statuses: could not list worksheets: %s", exc)
+                if not self._ws_titles_cache:
+                    return out
+        all_titles = self._ws_titles_cache
 
         month_pattern = re.compile(r'^\d{2}\.\d{4}$')  # e.g. "03.2026"
         tabs_to_scan = [
             t for t in all_titles
-            if month_pattern.match(t) or t == self.cfg.GOOGLE_WORKSHEET_NAME
+            if (month_pattern.match(t) or t == self.cfg.GOOGLE_WORKSHEET_NAME)
+            and (tabs_filter is None or t in tabs_filter)
         ]
 
         for tab_name in tabs_to_scan:
@@ -2005,7 +2019,19 @@ class SyncService:
         self.flush_state()
 
     def sync_sheet_to_amo(self) -> None:
-        rows = self.sheet.iter_lead_statuses()
+        # Only scan the current-month tab plus any archived tab that still hosts
+        # a live (non-terminal) lead.  This avoids reading old monthly tabs that
+        # contain only finalised leads and will never produce a status change.
+        _terminal_statuses = {"Успешно", "Отказ", "Закрыто и не реализовано"}
+        _tz = timezone(timedelta(hours=self.cfg.DISPLAY_TZ_OFFSET))
+        _active_tabs: set = {
+            datetime.now(_tz).strftime("%m.%Y"),  # current month — always scan
+            self.cfg.GOOGLE_WORKSHEET_NAME,        # legacy / main tab
+        }
+        for _lid, _tab in self.state.get("lead_tab_by_lead", {}).items():
+            if self.state.get("sheet_status_by_lead", {}).get(_lid, "") not in _terminal_statuses:
+                _active_tabs.add(_tab)
+        rows = self.sheet.iter_lead_statuses(tabs_filter=_active_tabs)
         visible_ids = {item["lead_id"] for item in rows}
         self._detect_deleted_rows(visible_ids)
         for item in rows:
