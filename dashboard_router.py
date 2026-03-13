@@ -35,7 +35,7 @@ _leads_cache: Dict = {}  # (date_from, date_to) → {"ts": float, "leads": list}
 # ── Session store ─────────────────────────────────────────────────
 # token → {"username": str, "created_at": float}
 _sessions: Dict[str, Dict] = {}
-_SESSION_TTL = int(os.getenv("DASHBOARD_SESSION_TTL", str(8 * 3600)))  # default 8 h
+_SESSION_TTL = int(os.getenv("DASHBOARD_SESSION_TTL", str(8 * 3600)).strip("'\""))  # default 8 h
 
 
 def _load_admins() -> List[Dict[str, str]]:
