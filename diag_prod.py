@@ -277,7 +277,54 @@ try:
         warn("AMO_DOMAIN not set")
 except Exception as e:
     warn(f"Network check skipped: {e}")
+# ── 11. Cloudflared tunnel status ─────────────────────────────────────────────
 
+section("11. CLOUDFLARED TUNNEL STATUS")
+print(run("systemctl status cloudflared --no-pager -l"))
+print(run("journalctl -u cloudflared -n 15 --no-pager"))
+cfd_ps = run("ps aux | grep '[c]loudflared'")
+if cfd_ps.strip():
+    ok(f"cloudflared process: {cfd_ps[:200]}")
+else:
+    err("cloudflared process NOT running — AMO cannot reach the webhook endpoint!")
+
+# ── 12. Webhook endpoint self-test ────────────────────────────────────────────
+
+section("12. LOCAL WEBHOOK ENDPOINT SELF-TEST")
+local_health = run("curl -s --max-time 5 http://localhost:8000/health")
+if local_health:
+    ok(f"localhost:8000/health → {local_health}")
+else:
+    err("localhost:8000/health did not respond — uvicorn may not be accepting connections")
+
+# Check what the .env says the public webhook URL is
+try:
+    env_file = Path("/home/amo2gsheet/.env")
+    if not env_file.exists():
+        env_file = Path("/root/amo2gsheet/.env")
+    if env_file.exists():
+        env_text = env_file.read_text(errors="replace")
+        for line in env_text.splitlines():
+            if any(k in line.upper() for k in ("WEBHOOK", "TUNNEL", "PUBLIC_URL", "HOOK_URL")):
+                info(f".env: {line.strip()}")
+    else:
+        warn(".env file not found at /home/amo2gsheet/.env or /root/amo2gsheet/.env")
+except Exception as e:
+    warn(f"Could not read .env: {e}")
+
+# ── 13. Last 20 INFO lines (recent activity) ─────────────────────────────────
+
+section("13. LAST 20 NON-ERROR LINES FROM app.log (recent activity)")
+for log_path in LOG_FILES:
+    if "app.log" != log_path.name:
+        continue
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        non_error = [l for l in lines if not ERROR_RE.search(l) and l.strip()][-20:]
+        for l in non_error:
+            print(f"  {l[:200]}")
+    except Exception as e:
+        warn(f"Cannot read {log_path}: {e}")
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 section("DONE")

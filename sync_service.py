@@ -2090,7 +2090,15 @@ class SyncService:
                             lead_id, order_number, lead_pipeline_id,
                         )
                 except Exception as exc:
-                    _log.error("Failed to push order# for lead %s: %s", lead_id, exc)
+                    if "Lead not found" in str(exc):
+                        _log.warning(
+                            "Lead %s no longer exists in AMO (deleted/merged) — "
+                            "suppressing order# push and marking as handled",
+                            lead_id,
+                        )
+                        self.remember_sheet_order_number(lead_id, order_number)
+                    else:
+                        _log.error("Failed to push order# for lead %s: %s", lead_id, exc)
 
             # ── Order-number update/clear: Заказ № changed or erased → sync to AMO field ──
             # This fires when the order number was already tracked (non-empty known_order)
@@ -2116,7 +2124,15 @@ class SyncService:
                     )
                     self.remember_sheet_order_number(lead_id, order_number)
                 except Exception as exc:
-                    _log.error("Failed to update order# for lead %s: %s", lead_id, exc)
+                    if "Lead not found" in str(exc):
+                        _log.warning(
+                            "Lead %s no longer exists in AMO (deleted/merged) — "
+                            "suppressing order# update and marking as handled",
+                            lead_id,
+                        )
+                        self.remember_sheet_order_number(lead_id, order_number)
+                    else:
+                        _log.error("Failed to update order# for lead %s: %s", lead_id, exc)
 
             # ── Status trigger: sheet status changed → push to AMO ──
             if status_name not in self.cfg.STATUS_MAP:
@@ -2171,7 +2187,15 @@ class SyncService:
                 )
                 self.remember_sheet_status(lead_id, status_name)
             except Exception as exc:
-                _log.error("Failed to sync sheet→amo for lead %s: %s", lead_id, exc)
+                if "Lead not found" in str(exc):
+                    _log.warning(
+                        "Lead %s no longer exists in AMO (deleted/merged) — "
+                        "suppressing status sync and marking as handled to stop retries",
+                        lead_id,
+                    )
+                    self.remember_sheet_status(lead_id, status_name)
+                else:
+                    _log.error("Failed to sync sheet→amo for lead %s: %s", lead_id, exc)
         # One disk write for all status updates in this poll cycle
         self.flush_state()
 
