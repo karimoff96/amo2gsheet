@@ -2290,7 +2290,10 @@ def on_startup() -> None:
         except Exception as exc:
             _log.error("Initial date-range sync failed: %s", exc)
 
-    # Retry bootstrap on Sheets quota errors (429)
+    # Retry bootstrap — back off on quota errors, log-and-continue on everything else.
+    # We never let bootstrap crash the process: a failed bootstrap means the poll
+    # worker starts with empty state (safe) rather than killing the service and
+    # triggering a systemd restart that would cause AMO to blacklist the webhook.
     for attempt in range(1, 6):
         try:
             service.bootstrap_sheet_state()
@@ -2301,8 +2304,11 @@ def on_startup() -> None:
                 wait = attempt * 30
                 _log.warning("Sheets quota hit during bootstrap (attempt %d), retrying in %ds...", attempt, wait)
                 time.sleep(wait)
+            elif attempt < 5:
+                _log.error("Bootstrap attempt %d failed (%s) — retrying in 30s...", attempt, exc)
+                time.sleep(30)
             else:
-                raise
+                _log.error("Bootstrap failed after 5 attempts (%s) — starting with empty state", exc)
 
     def worker() -> None:
         backoff = 0

@@ -1,10 +1,8 @@
 [Unit]
 Description=amoCRM <-> Google Sheets Sync
-Documentation=file:///root/amo2gsheet/SETUP_GUIDE.md
+Documentation=file:///home/amo2gsheet/SETUP_GUIDE.md
 After=network-online.target
 Wants=network-online.target
-# If cloudflared tunnel is used, wait for it too
-After=cloudflared.service
 # Rate-limit restarts: if it crashes more than 5 times in 60s, stop trying
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -12,18 +10,19 @@ StartLimitBurst=5
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/amo2gsheet
+WorkingDirectory=/home/amo2gsheet
 
-# Wrapper sources .env (supports comments) then starts uvicorn
-ExecStart=/bin/bash /root/amo2gsheet/deploy/start.sh
+# Wrapper loads .env via python-dotenv then starts uvicorn
+ExecStart=/bin/bash /home/amo2gsheet/deploy/start.sh
 
-# Restart policy — always restart, even on clean exit
-Restart=always
-RestartSec=5
-# Give it 30s to start up before systemd considers it timed out
-TimeoutStartSec=30
-# Give it 10s to shut down gracefully before SIGKILL
-TimeoutStopSec=10
+# Only restart on unexpected crashes — NOT on clean stop (systemctl stop / update.sh)
+# This prevents AMO from blacklisting the webhook after intentional restarts.
+Restart=on-failure
+RestartSec=10
+# Give it 60s to start up (bootstrap_sheet_state can take time on a cold start)
+TimeoutStartSec=60
+# Give it 30s to flush state and shut down gracefully before SIGKILL
+TimeoutStopSec=30
 
 # Environment
 Environment=PYTHONUNBUFFERED=1
