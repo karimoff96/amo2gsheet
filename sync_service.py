@@ -2451,7 +2451,7 @@ def on_startup() -> None:
     def worker() -> None:
         backoff = 0
         _catch_up_interval = max(1, 600 // max(1, service.cfg.SYNC_POLL_SECONDS))  # every ~10 min
-        _catch_up_counter  = _catch_up_interval  # fire immediately on first cycle
+        _catch_up_counter  = 0  # fire on very first cycle, then every ~10 min
         while True:
             try:
                 service.check_and_rotate_sheet()
