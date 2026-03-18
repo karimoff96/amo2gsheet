@@ -2268,7 +2268,10 @@ def _webhook_worker() -> None:
         try:
             leads = _webhook_queue.get()
             try:
-                service.process_webhook_leads(leads)
+                if not leads:
+                    _log_wh.debug("WEBHOOK WORKER: received empty batch, nothing to process")
+                else:
+                    service.process_webhook_leads(leads)
             except Exception as exc:
                 _log.error("Webhook worker error: %s", exc)
             finally:
@@ -2470,8 +2473,25 @@ async def oauth_exchange(payload: Dict[str, str]) -> Dict[str, Any]:
 async def webhook_amocrm(request: Request) -> Dict[str, Any]:
     raw = await request.body()
     content_type = request.headers.get("content-type", "")
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    _log_wh.debug(
+        "WEBHOOK ARRIVED: ip=%s content_type=%s body_size=%d",
+        client_ip, content_type, len(raw),
+    )
     payload = parse_payload(raw, content_type)
     leads = extract_leads(payload)
+    if leads:
+        status_ids = [int(l.get("status_id", 0) or 0) for l in leads]
+        lead_ids   = [str(l.get("id", "")) for l in leads]
+        _log_wh.info(
+            "WEBHOOK PARSED: %d lead(s) extracted — ids=%s status_ids=%s",
+            len(leads), lead_ids, status_ids,
+        )
+    else:
+        _log_wh.warning(
+            "WEBHOOK ARRIVED but 0 leads extracted — content_type=%s raw_body=%s",
+            content_type, raw[:500].decode("utf-8", errors="replace"),
+        )
     # Enqueue for async processing — return 200 immediately so AMO never
     # marks this webhook as failed due to a slow response.
     _webhook_queue.put(leads)
