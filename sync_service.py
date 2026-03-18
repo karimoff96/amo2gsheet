@@ -1583,9 +1583,40 @@ class SyncService:
 
         written = 0
         try:
+            # Build a reverse map: trigger_status_id → pipeline_id using the
+            # structure loaded at startup (pipeline_status_name_to_id).
+            status_to_pipeline: Dict[int, int] = {}
+            for pid, statuses in self.pipeline_status_name_to_id.items():
+                for _name, sid in statuses.items():
+                    if sid in self.trigger_status_ids:
+                        status_to_pipeline[sid] = pid
+
+            # AMO API v4 requires paired pipeline+status filters:
+            # filter[statuses][N][pipeline_id]=P&filter[statuses][N][status_id]=S
+            pairs = [
+                (status_to_pipeline[sid], sid)
+                for sid in sorted(self.trigger_status_ids)
+                if sid in status_to_pipeline
+            ]
+
+            if not pairs:
+                _log.warning(
+                    "CATCH-UP: could not resolve pipeline IDs for trigger statuses %s — skipping",
+                    sorted(self.trigger_status_ids),
+                )
+                return 0
+
             ids_param = "&".join(
-                f"filter[status_id][]={sid}" for sid in sorted(self.trigger_status_ids)
+                f"filter[statuses][{i}][pipeline_id]={pid}"
+                f"&filter[statuses][{i}][status_id]={sid}"
+                for i, (pid, sid) in enumerate(pairs)
             )
+
+            _log.debug(
+                "CATCH-UP: querying AMO for %d trigger status(es) across %d pipeline(s)",
+                len(pairs), len({p for p, _ in pairs}),
+            )
+
             leads: List[Dict[str, Any]] = []
             page = 1
             while True:
@@ -1599,6 +1630,8 @@ class SyncService:
                 if not (data.get("_links") or {}).get("next"):
                     break
                 page += 1
+
+            _log.debug("CATCH-UP: AMO returned %d lead(s) in trigger status(es)", len(leads))
 
             if not leads:
                 return 0
