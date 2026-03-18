@@ -1568,6 +1568,98 @@ class SyncService:
         self.flush_state()  # Persist all initial sync state in one write
         _log.info("Initial sync complete: %d written, %d skipped.", written, skipped)
 
+    def catch_up_trigger_leads(self) -> int:
+        """Poll AMO for leads currently in any trigger status and write missing ones to the sheet.
+
+        Called periodically from the worker loop to self-heal leads that were
+        missed because AMO stopped retrying webhook delivery after consecutive
+        failures (e.g. during a service restart).
+
+        Only writes leads that have no known sheet status — leads already
+        tracked are left untouched.
+        """
+        if not self.trigger_status_ids:
+            return 0
+
+        written = 0
+        try:
+            ids_param = "&".join(
+                f"filter[status_id][]={sid}" for sid in sorted(self.trigger_status_ids)
+            )
+            leads: List[Dict[str, Any]] = []
+            page = 1
+            while True:
+                data = self.amo.get(
+                    f"/api/v4/leads?{ids_param}&limit=250&page={page}"
+                )
+                batch = (data.get("_embedded") or {}).get("leads") or []
+                if not batch:
+                    break
+                leads.extend(batch)
+                if not (data.get("_links") or {}).get("next"):
+                    break
+                page += 1
+
+            if not leads:
+                return 0
+
+            # Enrich contacts in batches (phone numbers, names)
+            self._batch_enrich_contacts(leads)
+            staff_mapping = self.sheet.get_staff_mapping()
+
+            for lead in leads:
+                lead_id = str(lead.get("id", "")).strip()
+                if not lead_id:
+                    continue
+
+                # Skip leads already tracked — they were handled by webhook
+                if self.get_known_sheet_status(lead_id):
+                    continue
+
+                # Apply LEADS_CREATED_AFTER filter
+                if self.cfg.LEADS_CREATED_AFTER:
+                    updated_at = int(lead.get("updated_at", 0) or 0)
+                    if updated_at and updated_at < self.cfg.LEADS_CREATED_AFTER:
+                        continue
+
+                # Apply PIPELINE_KEYWORD filter
+                pipeline_id   = int(lead.get("pipeline_id", 0) or 0)
+                pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
+                if self.cfg.PIPELINE_KEYWORD and self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
+                    continue
+
+                status_id            = int(lead.get("status_id", 0) or 0)
+                responsible_id       = int(lead.get("responsible_user_id", 0) or 0)
+                responsible_name     = self.users_map.get(responsible_id, str(responsible_id))
+                current_status_name  = self.status_id_to_display_name.get(status_id, "В процессе")
+
+                tab_name = self._tab_for_lead(lead)
+                row = build_row(lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
+                # Space out sheet writes to avoid Google Sheets quota (10 writes/sec limit).
+                # Uses the same AMO throttle delay as a safe floor; avoids an extra config key.
+                if written > 0:
+                    time.sleep(max(self.cfg.AMO_REQUEST_DELAY_SEC, 0.5))
+                self.sheet.upsert_row(row, tab_name)
+                self.remember_sheet_status(lead_id, current_status_name)
+                self.remember_lead_tab(lead_id, tab_name)
+                self.remember_lead_pipeline(lead_id, pipeline_id)
+                actual_order_num = str(row[ORDER_NUM_COL_INDEX]) if len(row) > ORDER_NUM_COL_INDEX else ""
+                self.remember_sheet_order_number(lead_id, actual_order_num)
+                written += 1
+                _log.info(
+                    "CATCH-UP lead=%s pipeline='%s' status='%s' → written to sheet tab='%s'",
+                    lead_id, pipeline_name, current_status_name, tab_name,
+                )
+
+            if written:
+                self.flush_state()
+                _log.info("CATCH-UP: wrote %d missed lead(s) to sheet", written)
+
+        except Exception as exc:
+            _log.error("CATCH-UP failed: %s", exc)
+
+        return written
+
     def check_and_rotate_sheet(self) -> None:
         """Archive the active worksheet when the month rolls over.
 
@@ -2325,11 +2417,20 @@ def on_startup() -> None:
 
     def worker() -> None:
         backoff = 0
+        _catch_up_interval = max(1, 600 // max(1, service.cfg.SYNC_POLL_SECONDS))  # every ~10 min
+        _catch_up_counter  = _catch_up_interval  # fire immediately on first cycle
         while True:
             try:
                 service.check_and_rotate_sheet()
                 service.expire_finished_leads()
                 service.sync_sheet_to_amo()
+                # Periodically poll AMO for leads in trigger status to catch any
+                # that were missed because AMO stopped retrying webhook delivery
+                # after consecutive failures (e.g. during a service restart).
+                _catch_up_counter -= 1
+                if _catch_up_counter <= 0:
+                    service.catch_up_trigger_leads()
+                    _catch_up_counter = _catch_up_interval
                 backoff = 0
             except Exception as exc:
                 msg = str(exc)

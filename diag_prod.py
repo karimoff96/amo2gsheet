@@ -74,6 +74,7 @@ print(run("journalctl -u amo2gsheet -n 20 --no-pager"))
 section("2. LOG FILE SIZES & MODIFICATION TIMES")
 
 LOG_DIRS = [
+    Path("/home/amo2gsheet/logs"),
     Path("/root/amo2gsheet/logs"),
     Path("/var/log/amo2gsheet"),
 ]
@@ -147,16 +148,23 @@ for log_path in LOG_FILES:
 section("5. AMO API TOKEN CHECK (live request)")
 
 try:
-    sys.path.insert(0, "/root/amo2gsheet")
+    _app_dir = "/home/amo2gsheet"
+    if not Path(_app_dir).exists():
+        _app_dir = "/root/amo2gsheet"
+    sys.path.insert(0, _app_dir)
     from env_loader import load_env
     load_env()
 
-    AMO_DOMAIN   = os.getenv("AMO_DOMAIN", "").strip().rstrip("/")
-    ACCESS_TOKEN = os.getenv("AMO_ACCESS_TOKEN", "").strip()
-    TOKEN_FILE   = os.getenv("AMO_TOKEN_STORE", "/root/amo2gsheet/data/tokens.json")
+    AMO_SUBDOMAIN = os.getenv("AMO_SUBDOMAIN", "").strip()
+    AMO_DOMAIN    = f"https://{AMO_SUBDOMAIN}.amocrm.ru" if AMO_SUBDOMAIN else ""
+    TOKEN_FILE    = os.getenv("AMO_TOKEN_STORE", f"{_app_dir}/data/tokens.json")
+    # Make path absolute relative to app dir if it's relative
+    if TOKEN_FILE and not TOKEN_FILE.startswith("/"):
+        TOKEN_FILE = f"{_app_dir}/{TOKEN_FILE}"
+    ACCESS_TOKEN  = ""
 
     # Prefer token from the rotating token store if available
-    token_source = "env"
+    token_source = "(not found)"
     if Path(TOKEN_FILE).exists():
         try:
             stored = json.loads(Path(TOKEN_FILE).read_text())
@@ -173,10 +181,13 @@ try:
                         ok(f"Token expires at {exp_dt} ({(exp_dt-now).seconds//3600}h left)")
         except Exception as e:
             warn(f"Could not parse token store: {e}")
+    else:
+        warn(f"Token store not found: {TOKEN_FILE}")
 
-    info(f"AMO_DOMAIN   = {AMO_DOMAIN}")
-    info(f"Token source = {token_source}")
-    info(f"Token prefix = {ACCESS_TOKEN[:12]}…" if ACCESS_TOKEN else "No token found")
+    info(f"AMO_SUBDOMAIN = {AMO_SUBDOMAIN}")
+    info(f"AMO_DOMAIN    = {AMO_DOMAIN}")
+    info(f"Token source  = {token_source}")
+    info(f"Token prefix  = {ACCESS_TOKEN[:12]}…" if ACCESS_TOKEN else "  No token found")
 
     if AMO_DOMAIN and ACCESS_TOKEN:
         import urllib.request
@@ -201,14 +212,14 @@ except Exception as e:
 section("6. GOOGLE SHEETS ACCESS CHECK (live request)")
 
 try:
-    GSHEET_CREDS_FILE = os.getenv(
-        "GSHEET_CREDS",
-        "/root/amo2gsheet/prod_gsheet.json",
-    )
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+    GSHEET_CREDS_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    # Make path absolute relative to app dir if it's relative
+    if GSHEET_CREDS_FILE and not GSHEET_CREDS_FILE.startswith("/"):
+        GSHEET_CREDS_FILE = f"{_app_dir}/{GSHEET_CREDS_FILE}"
+    SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 
     info(f"Creds file      = {GSHEET_CREDS_FILE}")
-    info(f"SPREADSHEET_ID  = {SPREADSHEET_ID}")
+    info(f"GOOGLE_SHEET_ID = {SPREADSHEET_ID}")
 
     if not Path(GSHEET_CREDS_FILE).exists():
         err(f"Credentials file not found: {GSHEET_CREDS_FILE}")
@@ -270,11 +281,12 @@ print(ps if ps else "  (no matching processes found)")
 
 section("10. NETWORK — DNS & TLS to AMO domain")
 try:
-    AMO_HOST = os.getenv("AMO_DOMAIN", "").strip().lstrip("https://").split("/")[0]
-    if AMO_HOST:
+    _amo_sub = os.getenv("AMO_SUBDOMAIN", "").strip()
+    if _amo_sub:
+        AMO_HOST = f"{_amo_sub}.amocrm.ru"
         print(run(f"curl -sI --max-time 5 https://{AMO_HOST}/api/v4/account | head -5"))
     else:
-        warn("AMO_DOMAIN not set")
+        warn("AMO_SUBDOMAIN not set")
 except Exception as e:
     warn(f"Network check skipped: {e}")
 # ── 11. Cloudflared tunnel status ─────────────────────────────────────────────
