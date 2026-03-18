@@ -2155,6 +2155,16 @@ class SyncService:
                     lead_pipeline_id = int(_p.get("pipeline_id", 0) or 0)
                     if lead_pipeline_id:
                         self.remember_lead_pipeline(lead_id, lead_pipeline_id)
+                    else:
+                        # AMO returned 204 / empty body — lead is deleted or trashed.
+                        # Mark as handled so this lead never re-enters the polling loop.
+                        _log.warning(
+                            "Lead %s returned no pipeline_id from AMO (204/deleted/trashed) — "
+                            "suppressing status sync and marking as handled to stop polling loop",
+                            lead_id,
+                        )
+                        self.remember_sheet_status(lead_id, status_name)
+                        continue
 
                 # Translate the sheet status to the AMO display name we want to target
                 amo_lookup = SHEET_STATUS_TO_AMO_DISPLAY.get(status_name, status_name)
