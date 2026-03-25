@@ -154,35 +154,38 @@ def create_dashboard_router(service) -> APIRouter:
         return HTMLResponse(_DASHBOARD_HTML)
 
     # ── JSON stats API ────────────────────────────────────────────────────────
+    _snap_dates_cache: Dict = {"ts": 0.0, "data": []}
+
     @router.get("/api/dashboard/stats", tags=["dashboard"])
     def dashboard_stats(
-        date_from: str = Query(default="", description="YYYY-MM-DD, defaults to today"),
-        date_to:   str = Query(default="", description="YYYY-MM-DD, defaults to today"),
-        group:     str = Query(default="", description="Group filter: A / B / C / D"),
-        force:     int = Query(default=0,  description="Set to 1 to bypass cache"),
+        date_from:  str = Query(default="", description="YYYY-MM-DD, defaults to today"),
+        date_to:    str = Query(default="", description="YYYY-MM-DD, defaults to today"),
+        group:      str = Query(default="", description="Group filter"),
+        staff_code: str = Query(default="", description="Filter by staff code"),
+        force:      int = Query(default=0,  description="Set to 1 to bypass cache"),
     ) -> Dict[str, Any]:
         import traceback
-        _empty = {"groups": {}, "date_from": date_from, "date_to": date_to,
-                  "total_consul": 0, "total_zakas": 0, "total_otkaz": 0, "total_dumka": 0,
-                  "total_summa": 0, "avg_conversion": 0.0}
+        _empty = {
+            "groups": {}, "date_from": date_from, "date_to": date_to,
+            "is_live": False, "total_consul": 0, "total_zakas": 0,
+            "total_summa": 0, "total_uspeshka": 0, "total_uspeshka_summa": 0,
+            "avg_zakaz_conv": 0.0, "avg_uspeshka_conv": 0.0,
+        }
         try:
             today = date.today().strftime("%Y-%m-%d")
-            if not date_from:
-                date_from = today
-            if not date_to:
-                date_to = today
+            if not date_from: date_from = today
+            if not date_to:   date_to   = today
+            yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-            # ── Serve from cache when available ─────────────────────────────────
-            cache_key = (date_from, date_to)
+            # ── Cache ──────────────────────────────────────────────────────────
+            cache_key = (date_from, date_to, group, staff_code)
             has_today = (date_from <= today <= date_to)
             cache_ttl = 60 if has_today else 300
             cached    = _stats_cache.get(cache_key)
             if cached and not force and (time.monotonic() - cached["ts"]) < cache_ttl:
                 return cached["data"]
 
-            # ── 1. Load Staff sheet: code → {code, group, full_name} ──────────
-            # Cached for _STAFF_CACHE_TTL seconds to avoid hitting Google Sheets API
-            # on every dashboard refresh.
+            # ── 1. Load Staff sheet ───────────────────────────────────────────
             staff_by_code: Dict[str, Dict] = {}
             now_ts = time.monotonic()
             if _staff_cache["data"] is not None and (now_ts - _staff_cache["ts"]) < _STAFF_CACHE_TTL:
@@ -195,78 +198,50 @@ def create_dashboard_router(service) -> APIRouter:
                 except Exception as exc:
                     print(f"[DASHBOARD] Could not load Staff sheet: {exc}")
                     if _staff_cache["data"] is not None:
-                        staff_by_code = _staff_cache["data"]  # use stale data on error
+                        staff_by_code = _staff_cache["data"]
 
-            # ── 1b. Build sotuv (sales) pipeline ID set for filtering ─────────
-            pipeline_keyword = getattr(service.cfg, "PIPELINE_KEYWORD", "sotuv").lower()
-            sotuv_pipeline_ids: set[int] = set()
-            if pipeline_keyword:
-                for pid, pname in service.pipeline_id_to_name.items():
-                    if pipeline_keyword in pname.lower():
-                        sotuv_pipeline_ids.add(pid)
-            # If keyword matches nothing, fall back to all pipelines
-            if not sotuv_pipeline_ids:
-                sotuv_pipeline_ids = set(service.pipeline_id_to_name.keys())
+            # ── 2. Smart data source ───────────────────────────────────────────
+            # Past days with snapshots → manager_snapshots (0 AMO API calls)
+            # Today without a snapshot → live kpi_events
+            merged: Dict[str, Dict] = {}  # staff_code → aggregated row
 
-            # ── 1c. Fetch leads for Приемщик table (live AMO query) ──────────
-            # Staff KPI data now comes from the local SQLite store (event-driven).
-            # Only the Приемщик table is still sourced from live AMO leads.
-            leads: List[Dict] = []
-            try:
-                leads = service.amo.fetch_leads_by_date_range(date_from, date_to)
-            except Exception as exc:
-                print(f"[DASHBOARD] Leads fetch failed (Приемщик): {exc}")
+            def _add_kpi_row(code: str, row: Dict) -> None:
+                if code not in merged:
+                    merged[code] = {
+                        "consul": 0, "zakas": 0, "summa": 0.0,
+                        "uspeshka": 0, "uspeshka_summa": 0.0,
+                        "otkaz": 0, "dumka": 0,
+                    }
+                m = merged[code]
+                m["consul"]         += int(row.get("consul", 0))
+                m["zakas"]          += int(row.get("zakas", 0))
+                m["summa"]          += float(row.get("summa", 0))
+                m["uspeshka"]       += int(row.get("uspeshka", 0))
+                m["uspeshka_summa"] += float(row.get("uspeshka_summa", 0))
+                m["otkaz"]          += int(row.get("otkaz", 0))
+                m["dumka"]          += int(row.get("dumka", 0))
 
-            # Cache raw leads for the export endpoint (same TTL as stats)
-            _leads_cache[cache_key] = {"ts": time.monotonic(), "leads": leads}
+            # Past days with snapshots
+            if date_from <= yesterday:
+                snap_to   = min(date_to, yesterday)
+                snap_rows = service.kpi_store.get_manager_stats_snapshot(date_from, snap_to)
+                for row in snap_rows:
+                    _add_kpi_row(str(row["staff_code"]), row)
 
-            # ── 2. Приемщик aggregation (live AMO data — unchanged) ───────────
-            priemshchik_stats: Dict[str, Dict] = {}
-            for lead in leads:
-                lead_pipeline_id = int(lead.get("pipeline_id", 0) or 0)
-                if sotuv_pipeline_ids and lead_pipeline_id not in sotuv_pipeline_ids:
-                    continue
-                status_id      = int(lead.get("status_id", 0) or 0)
-                status_display = service.status_id_to_display_name.get(status_id, "")
-                budget         = float(lead.get("price", 0) or 0)
-                is_zakas       = status_display in ZAKAS_DISPLAY_NAMES
-                is_otkaz       = status_display in OTKAZ_DISPLAY_NAMES
-                is_dumka       = status_display in DUMKA_DISPLAY_NAMES
-                cf_values      = lead.get("custom_fields_values") or []
-                for cf in cf_values:
-                    fname = " ".join((cf.get("field_name") or "").split())
-                    if fname in ("Приемщик", "Приёмщик"):
-                        vals = cf.get("values") or []
-                        if vals:
-                            p_name = str(vals[0].get("value", "")).strip()
-                            if p_name:
-                                if p_name not in priemshchik_stats:
-                                    priemshchik_stats[p_name] = {
-                                        "name": p_name, "consul": 0, "zakas": 0,
-                                        "otkaz": 0, "dumka": 0, "summa": 0.0,
-                                    }
-                                priemshchik_stats[p_name]["consul"] += 1
-                                if is_zakas:
-                                    priemshchik_stats[p_name]["zakas"] += 1
-                                    priemshchik_stats[p_name]["summa"] += budget
-                                if is_otkaz:
-                                    priemshchik_stats[p_name]["otkaz"] += 1
-                                if is_dumka:
-                                    priemshchik_stats[p_name]["dumka"] += 1
-                        break
+            # Today (live kpi_events)
+            is_live = False
+            if date_to >= today:
+                is_live   = not service.kpi_store.has_snapshot(today)
+                live_rows = service.kpi_store.get_staff_stats(today, today)
+                for row in live_rows:
+                    _add_kpi_row(str(row["staff_code"]), row)
 
-            # ── 3. Staff stats from KPI SQLite store (event-driven, accurate) ──
-            # Events are recorded on the date they HAPPENED, so:
-            #   consul → date the lead entered КОНСУЛЬТАЦИЯ (= Лид for that staff)
-            #   zakas  → date the ЗАКАЗ transition occurred  (may be a later day)
-            #   dumka  → date the ДУМКА transition occurred
-            # ДУМКА recovery within 5 days is credited on the recovery date, NOT
-            # the original consul date — matching the business salary calculation.
-            kpi_rows = service.kpi_store.get_staff_stats(date_from, date_to)
-            user_stats: Dict[str, Dict] = {}
+            # ── 3. Resolve staff, apply filters, compute KPIs ─────────────────
+            rows_out: List[Dict] = []
             skipped_unknown = 0
-            for kpi in kpi_rows:
-                code = str(kpi["staff_code"]).strip()
+            for code, agg in merged.items():
+                if staff_code and code != staff_code.strip():
+                    continue
                 staff_info = (
                     staff_by_code.get(code)
                     or staff_by_code.get(code.lstrip("0"))
@@ -275,44 +250,37 @@ def create_dashboard_router(service) -> APIRouter:
                 if not staff_info:
                     skipped_unknown += 1
                     continue
-                user_stats[code] = {
-                    "code":   code,
-                    "name":   staff_info["full_name"],
-                    "group":  staff_info["group"],
-                    "consul": int(kpi["consul"]),
-                    "zakas":  int(kpi["zakas"]),
-                    "otkaz":  0,
-                    "dumka":  int(kpi["dumka"]),
-                    "summa":  float(kpi["summa"]),
-                }
-
-            # ── 4. Build staff rows with conversion ────────────────────────────
-            rows_out: List[Dict] = []
-            for st in user_stats.values():
-                consul = st["consul"]
-                zakas  = st["zakas"]
-                dumka  = st["dumka"]
-                conv   = round(zakas / consul * 100, 1) if consul else 0.0
+                g = staff_info["group"]
+                if group and g.upper() != group.upper():
+                    continue
+                consul         = agg["consul"]
+                zakas          = agg["zakas"]
+                summa          = agg["summa"]
+                uspeshka       = agg["uspeshka"]
+                uspeshka_summa = agg["uspeshka_summa"]
+                otkaz          = agg["otkaz"]
+                dumka          = agg["dumka"]
+                zakaz_conv    = round(zakas / consul * 100, 1) if consul else 0.0
+                uspeshka_conv = round(uspeshka_summa / summa * 100, 1) if summa else 0.0
                 rows_out.append({
-                    "code":       st["code"],
-                    "name":       st["name"],
-                    "group":      st["group"],
-                    "summa":      int(st["summa"]),
-                    "zakas":      zakas,
-                    "otkaz":      0,
-                    "dumka":      dumka,
-                    "consul":     consul,
-                    "conversion": conv,
+                    "code":           code,
+                    "name":           staff_info["full_name"],
+                    "group":          g,
+                    "consul":         consul,
+                    "zakas":          zakas,
+                    "summa":          int(summa),
+                    "uspeshka":       uspeshka,
+                    "uspeshka_summa": int(uspeshka_summa),
+                    "otkaz":          otkaz,
+                    "dumka":          dumka,
+                    "zakaz_conv":     zakaz_conv,
+                    "uspeshka_conv":  uspeshka_conv,
                 })
 
-            # ── 5. Group filter ───────────────────────────────────────────────
-            if group:
-                rows_out = [r for r in rows_out if r["group"].upper() == group.upper()]
-
-            # ── 6. Sort ───────────────────────────────────────────────────────
+            # ── 4. Sort + number ──────────────────────────────────────────────
             rows_out.sort(key=lambda x: (-x["summa"], x["name"]))
 
-            # ── 7. Group by Отдел, add row numbers ────────────────────────────
+            # ── 5. Group by Группа ────────────────────────────────────────────
             groups: Dict[str, List] = {}
             for r in rows_out:
                 g = r["group"] or "—"
@@ -321,47 +289,28 @@ def create_dashboard_router(service) -> APIRouter:
                 for i, row in enumerate(g_rows, 1):
                     row["num"] = i
 
-            # ── 8. Totals ─────────────────────────────────────────────────────
-            all_consul = sum(r["consul"] for r in rows_out)
-            all_zakas  = sum(r["zakas"]  for r in rows_out)
-            all_otkaz  = sum(r["otkaz"]  for r in rows_out)
-            all_dumka  = sum(r["dumka"]  for r in rows_out)
-            all_summa  = sum(r["summa"]  for r in rows_out)
-            avg_conv   = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
-
-            # ── 9. Build Приемщик rows ────────────────────────────────────────
-            priemshchik_rows: List[Dict] = []
-            for st in priemshchik_stats.values():
-                consul = st["consul"]
-                zakas  = st["zakas"]
-                otkaz  = st["otkaz"]
-                dumka  = st["dumka"]
-                conv   = round(zakas / consul * 100, 1) if consul else 0.0
-                priemshchik_rows.append({
-                    "name":       st["name"],
-                    "summa":      int(st["summa"]),
-                    "zakas":      zakas,
-                    "otkaz":      otkaz,
-                    "dumka":      dumka,
-                    "consul":     consul,
-                    "conversion": conv,
-                })
-            priemshchik_rows.sort(key=lambda x: (-x["summa"], x["name"]))
-            for i, r in enumerate(priemshchik_rows, 1):
-                r["num"] = i
+            # ── 6. Totals ─────────────────────────────────────────────────────
+            all_consul         = sum(r["consul"]         for r in rows_out)
+            all_zakas          = sum(r["zakas"]          for r in rows_out)
+            all_summa          = sum(r["summa"]          for r in rows_out)
+            all_uspeshka       = sum(r["uspeshka"]       for r in rows_out)
+            all_uspeshka_summa = sum(r["uspeshka_summa"] for r in rows_out)
+            avg_zakaz_conv    = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
+            avg_uspeshka_conv = round(all_uspeshka_summa / all_summa * 100, 1) if all_summa else 0.0
 
             result = {
-                "date_from":       date_from,
-                "date_to":         date_to,
-                "total_consul":    all_consul,
-                "total_zakas":     all_zakas,
-                "total_otkaz":     all_otkaz,
-                "total_dumka":     all_dumka,
-                "total_summa":     all_summa,
-                "avg_conversion":  avg_conv,
-                "skipped_unknown": skipped_unknown,
-                "groups":          groups,
-                "priemshchik":     priemshchik_rows,
+                "date_from":            date_from,
+                "date_to":              date_to,
+                "is_live":              is_live,
+                "total_consul":         all_consul,
+                "total_zakas":          all_zakas,
+                "total_summa":          all_summa,
+                "total_uspeshka":       all_uspeshka,
+                "total_uspeshka_summa": all_uspeshka_summa,
+                "avg_zakaz_conv":       avg_zakaz_conv,
+                "avg_uspeshka_conv":    avg_uspeshka_conv,
+                "skipped_unknown":      skipped_unknown,
+                "groups":               groups,
             }
             _stats_cache[cache_key] = {"ts": time.monotonic(), "data": result}
             return result
@@ -369,6 +318,42 @@ def create_dashboard_router(service) -> APIRouter:
         except Exception as exc:
             print(f"[DASHBOARD] Error in stats endpoint: {traceback.format_exc()}")
             return {**_empty, "error": str(exc), "date_from": date_from, "date_to": date_to}
+
+    @router.get("/api/dashboard/snapshot-dates", tags=["dashboard"])
+    def snapshot_dates_endpoint(request: Request) -> Dict[str, Any]:
+        """Return available snapshot dates, cached 60 s."""
+        if not _user(request):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        now = time.monotonic()
+        if now - _snap_dates_cache["ts"] < 60:
+            return {"dates": _snap_dates_cache["data"]}
+        dates = service.kpi_store.get_available_snapshot_dates()
+        _snap_dates_cache["ts"]   = now
+        _snap_dates_cache["data"] = dates
+        return {"dates": dates}
+
+    @router.post("/api/manager/snapshot", tags=["dashboard"])
+    async def trigger_snapshot(request: Request) -> Dict[str, Any]:
+        """Manually trigger a nightly snapshot for the given date. Requires auth."""
+        if not _user(request):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        snap_date = (payload.get("date") or "").strip()
+        if not snap_date:
+            return {"error": "date field required (YYYY-MM-DD)"}
+        import threading as _th
+        _th.Thread(
+            target=service.run_nightly_snapshot,
+            args=(snap_date,),
+            daemon=True,
+            name="manual-snapshot",
+        ).start()
+        return {"status": "started", "date": snap_date}
 
     # ── Monthly report endpoint ───────────────────────────────────────────────
     @router.get("/api/dashboard/monthly-report", tags=["dashboard"])
@@ -421,16 +406,18 @@ def create_dashboard_router(service) -> APIRouter:
 
             # ── Daily breakdown ───────────────────────────────────────────────
             daily_rows = service.kpi_store.get_daily_breakdown(date_from, date_to)
-            # daily_map: staff_code → {date → {consul, zakas, dumka, summa}}
+            # daily_map: staff_code → {date → {consul, zakas, dumka, summa, uspeshka, uspeshka_summa}}
             daily_map: Dict[str, Dict] = {}
             for dr in daily_rows:
                 code = str(dr["staff_code"])
                 d    = dr["event_date"]
                 daily_map.setdefault(code, {})[d] = {
-                    "consul": int(dr["consul"]),
-                    "zakas":  int(dr["zakas"]),
-                    "dumka":  int(dr["dumka"]),
-                    "summa":  float(dr["summa"]),
+                    "consul":         int(dr["consul"]),
+                    "zakas":          int(dr["zakas"]),
+                    "dumka":          int(dr["dumka"]),
+                    "summa":          float(dr["summa"]),
+                    "uspeshka":       int(dr.get("uspeshka", 0)),
+                    "uspeshka_summa": float(dr.get("uspeshka_summa", 0)),
                 }
 
             # ── Build output rows ─────────────────────────────────────────────
@@ -447,21 +434,25 @@ def create_dashboard_router(service) -> APIRouter:
                 dept = staff_info["group"]
                 if group and dept.upper() != group.upper():
                     continue
-                consul = int(kpi["consul"])
-                zakas  = int(kpi["zakas"])
-                dumka  = int(kpi["dumka"])
-                summa  = float(kpi["summa"])
-                conv   = round(zakas / consul * 100, 1) if consul else 0.0
+                consul         = int(kpi["consul"])
+                zakas          = int(kpi["zakas"])
+                dumka          = int(kpi["dumka"])
+                summa          = float(kpi["summa"])
+                uspeshka       = int(kpi.get("uspeshka", 0))
+                uspeshka_summa = float(kpi.get("uspeshka_summa", 0))
+                conv           = round(zakas / consul * 100, 1) if consul else 0.0
                 rows_out.append({
-                    "code":       code,
-                    "name":       staff_info["full_name"],
-                    "group":      dept,
-                    "consul":     consul,
-                    "zakas":      zakas,
-                    "dumka":      dumka,
-                    "summa":      int(summa),
-                    "conversion": conv,
-                    "daily":      daily_map.get(code, {}),
+                    "code":           code,
+                    "name":           staff_info["full_name"],
+                    "group":          dept,
+                    "consul":         consul,
+                    "zakas":          zakas,
+                    "dumka":          dumka,
+                    "summa":          int(summa),
+                    "uspeshka":       uspeshka,
+                    "uspeshka_summa": int(uspeshka_summa),
+                    "conversion":     conv,
+                    "daily":          daily_map.get(code, {}),
                 })
 
             rows_out.sort(key=lambda x: (-x["summa"], x["name"]))
@@ -473,22 +464,26 @@ def create_dashboard_router(service) -> APIRouter:
                 g = r["group"] or "—"
                 groups_out.setdefault(g, []).append(r)
 
-            all_consul = sum(r["consul"] for r in rows_out)
-            all_zakas  = sum(r["zakas"]  for r in rows_out)
-            all_dumka  = sum(r["dumka"]  for r in rows_out)
-            all_summa  = sum(r["summa"]  for r in rows_out)
-            avg_conv   = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
+            all_consul         = sum(r["consul"]         for r in rows_out)
+            all_zakas          = sum(r["zakas"]          for r in rows_out)
+            all_dumka          = sum(r["dumka"]           for r in rows_out)
+            all_summa          = sum(r["summa"]          for r in rows_out)
+            all_uspeshka       = sum(r["uspeshka"]       for r in rows_out)
+            all_uspeshka_summa = sum(r["uspeshka_summa"] for r in rows_out)
+            avg_conv           = round(all_zakas / all_consul * 100, 1) if all_consul else 0.0
 
             return {
-                "month":          month,
-                "date_from":      date_from,
-                "date_to":        date_to,
-                "total_consul":   all_consul,
-                "total_zakas":    all_zakas,
-                "total_dumka":    all_dumka,
-                "total_summa":    all_summa,
-                "avg_conversion": avg_conv,
-                "groups":         groups_out,
+                "month":            month,
+                "date_from":        date_from,
+                "date_to":          date_to,
+                "total_consul":     all_consul,
+                "total_zakas":      all_zakas,
+                "total_dumka":      all_dumka,
+                "total_summa":      all_summa,
+                "total_uspeshka":       all_uspeshka,
+                "total_uspeshka_summa": all_uspeshka_summa,
+                "avg_conversion":   avg_conv,
+                "groups":           groups_out,
             }
 
         except Exception as exc:
@@ -518,12 +513,7 @@ def create_dashboard_router(service) -> APIRouter:
             if not date_to:   date_to   = today
 
             # ── Re-use cached stats (triggers a fetch if needed) ─────────────
-            stats = dashboard_stats(request=request, date_from=date_from, date_to=date_to, group=group, force=0)
-
-            # ── Re-use cached raw leads for the detail sheet ──────────────
-            cache_key = (date_from, date_to)
-            leads_entry = _leads_cache.get(cache_key)
-            raw_leads: List[Dict] = leads_entry["leads"] if leads_entry else []
+            stats = dashboard_stats(date_from=date_from, date_to=date_to, group=group, force=0)
 
             # ── Style helpers ──────────────────────────────────────────────
             HDR_FILL  = PatternFill("solid", fgColor="1E3A5F")
@@ -586,8 +576,8 @@ def create_dashboard_router(service) -> APIRouter:
             ws2 = wb.create_sheet("Сотрудники")
             ws2.sheet_view.showGridLines = False
             STAFF_COLS = ["#", "Отдел", "Код", "Сотрудник",
-                          "Сумма", "Заказы", "Раздумья", "Отказы",
-                          "Консультации", "Конверсия %"]
+                          "Olag (Consul)", "Zakaz Soni", "Zakaz Konv.%",
+                          "Qilingan Summa", "Uspeshka Summas", "Uspeshka Konv.%"]
             row_num = 1
             hdr(ws2, row_num, STAFF_COLS)
             row_num += 1
@@ -603,114 +593,20 @@ def create_dashboard_router(service) -> APIRouter:
                 row_num += 1
                 for r in g_rows:
                     vals = [r.get("num",""), g_name, r["code"], r["name"],
-                            r["summa"], r["zakas"], r["dumka"], r["otkaz"],
-                            r["consul"], r["conversion"]]
+                            r["consul"], r["zakas"], r.get("zakaz_conv", 0),
+                            r["summa"], r.get("uspeshka_summa", 0), r.get("uspeshka_conv", 0)]
                     for c2, v in enumerate(vals, 1):
                         cell = ws2.cell(row=row_num, column=c2, value=v)
                         cell.border = BORDER
                         cell.alignment = CENTER if c2 != 4 else LEFT
-                        if c2 == 5:  # summa
+                        if c2 in (8, 9):  # summa columns
                             cell.number_format = "#,##0"
-                        if c2 == 10:  # conversion
+                        if c2 in (7, 10):  # conversion columns
                             cell.font = Font(bold=True, color=(
                                 "4ADE80" if (v or 0) >= 50 else
                                 "FACC15" if (v or 0) >= 25 else "F87171"))
                     row_num += 1
             autofit(ws2)
-
-            # ═════════════════════════════════════════════════════════════════
-            # Sheet 3: Приемщики
-            # ═════════════════════════════════════════════════════════════════
-            ws3 = wb.create_sheet("Приемщики")
-            ws3.sheet_view.showGridLines = False
-            PR_COLS = ["#", "Приемщик",
-                       "Сумма", "Заказы", "Раздумья",
-                       "Отказы", "Консультации", "Конверсия %"]
-            hdr(ws3, 1, PR_COLS)
-            for ri, r in enumerate(stats.get("priemshchik", []), 2):
-                vals = [r.get("num",ri-1), r["name"],
-                        r["summa"], r["zakas"], r["dumka"],
-                        r["otkaz"], r["consul"], r["conversion"]]
-                for c2, v in enumerate(vals, 1):
-                    cell = ws3.cell(row=ri, column=c2, value=v)
-                    cell.border = BORDER
-                    cell.alignment = CENTER if c2 != 2 else LEFT
-                    if c2 == 3:
-                        cell.number_format = "#,##0"
-                    if c2 == 8:
-                        cell.font = Font(bold=True, color=(
-                            "4ADE80" if (v or 0) >= 50 else
-                            "FACC15" if (v or 0) >= 25 else "F87171"))
-            autofit(ws3)
-
-            # ═════════════════════════════════════════════════════════════════
-            # Sheet 4: Лиды (детально по каждому лиду)
-            # ═════════════════════════════════════════════════════════════════
-            ws4 = wb.create_sheet("Лиды")
-            ws4.sheet_view.showGridLines = False
-            LEAD_COLS = ["ИД", "Дата создания", "Воронка", "Статус",
-                         "Код сотрудника", "Сотрудник", "Отдел",
-                         "Бюджет", "Заказ", "Отказ", "Раздумье"]
-            hdr(ws4, 1, LEAD_COLS)
-
-            # Build staff lookup from cache if available
-            staff_lkp: Dict[str, Dict] = _staff_cache.get("data") or {}
-
-            sotuv_ids = set()
-            if hasattr(service, "pipeline_id_to_name"):
-                kw = getattr(service.cfg, "PIPELINE_KEYWORD", "sotuv").lower()
-                for pid2, pname2 in service.pipeline_id_to_name.items():
-                    if kw in pname2.lower():
-                        sotuv_ids.add(pid2)
-
-            ri = 2
-            for lead in raw_leads:
-                lpid = int(lead.get("pipeline_id", 0) or 0)
-                if sotuv_ids and lpid not in sotuv_ids:
-                    continue
-                lid      = lead.get("id", "")
-                created  = lead.get("created_at", 0)
-                created_str = datetime.fromtimestamp(created).strftime("%d.%m.%Y %H:%M") if created else ""
-                pipeline_name = service.pipeline_id_to_name.get(lpid, str(lpid))
-                sid      = int(lead.get("status_id", 0) or 0)
-                status   = service.status_id_to_display_name.get(sid, "")
-                budget   = float(lead.get("price", 0) or 0)
-                cf_values = lead.get("custom_fields_values") or []
-
-                staff_code = ""
-                priemshchik_val = ""
-                for cf in cf_values:
-                    fname = " ".join((cf.get("field_name") or "").split())
-                    vals  = cf.get("values") or []
-                    if fname == "Код сотрудника" and vals:
-                        staff_code = str(vals[0].get("value", "")).strip()
-                    elif fname in ("Приемщик", "Приёмщик") and vals:
-                        priemshchik_val = str(vals[0].get("value", "")).strip()
-
-                try:
-                    norm_code = str(int(staff_code)) if staff_code else ""
-                except ValueError:
-                    norm_code = ""
-                staff_info = staff_lkp.get(norm_code) or staff_lkp.get(staff_code) or {}
-                staff_name  = staff_info.get("full_name", "")
-                staff_group = staff_info.get("group", "")
-
-                is_z = status in ZAKAS_DISPLAY_NAMES
-                is_o = status in OTKAZ_DISPLAY_NAMES
-                is_d = status in DUMKA_DISPLAY_NAMES
-
-                row_vals = [lid, created_str, pipeline_name, status,
-                            staff_code, staff_name, staff_group,
-                            budget, "✔" if is_z else "",
-                            "✔" if is_o else "", "✔" if is_d else ""]
-                for c2, v in enumerate(row_vals, 1):
-                    cell = ws4.cell(row=ri, column=c2, value=v)
-                    cell.border = BORDER
-                    cell.alignment = CENTER if c2 not in (3, 4, 6) else LEFT
-                    if c2 == 8:
-                        cell.number_format = "#,##0"
-                ri += 1
-            autofit(ws4)
 
             # ── Serialize to bytes ───────────────────────────────────────────────
             buf = io.BytesIO()
@@ -829,7 +725,7 @@ _LOGIN_HTML = """<!DOCTYPE html>
 </html>"""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Self-contained HTML dashboard page
+# Self-contained HTML dashboard page (Manager KPI — 10-column table)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -837,59 +733,63 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>KPI Dashboard</title>
+  <title>Manager KPI Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     body { background:#0b1120; color:#e2e8f0; font-family:'Inter',system-ui,sans-serif; }
 
-    /* ── Cards ── */
     .card  { background:#151f32; border:1px solid #1e2d45; border-radius:14px; }
-    .glass { background:rgba(21,31,50,.85); backdrop-filter:blur(12px); border:1px solid rgba(255,255,255,.07); border-radius:14px; }
 
     /* ── Group header accent colours ── */
-    .ghdr-a    { background:linear-gradient(90deg,#1d4ed820,#0b1120 80%); border-left:3px solid #3b82f6; }
-    .ghdr-b    { background:linear-gradient(90deg,#15803d20,#0b1120 80%); border-left:3px solid #22c55e; }
-    .ghdr-c    { background:linear-gradient(90deg,#9d174d20,#0b1120 80%); border-left:3px solid #ec4899; }
-    .ghdr-d    { background:linear-gradient(90deg,#92400e20,#0b1120 80%); border-left:3px solid #f59e0b; }
+    .ghdr-a { background:linear-gradient(90deg,#1d4ed820,#0b1120 80%); border-left:3px solid #3b82f6; }
+    .ghdr-b { background:linear-gradient(90deg,#15803d20,#0b1120 80%); border-left:3px solid #22c55e; }
+    .ghdr-c { background:linear-gradient(90deg,#9d174d20,#0b1120 80%); border-left:3px solid #ec4899; }
+    .ghdr-d { background:linear-gradient(90deg,#92400e20,#0b1120 80%); border-left:3px solid #f59e0b; }
     .ghdr-baza { background:linear-gradient(90deg,#5b21b620,#0b1120 80%); border-left:3px solid #a78bfa; }
     .ghdr-def  { background:linear-gradient(90deg,#33415520,#0b1120 80%); border-left:3px solid #64748b; }
 
     /* ── Table ── */
     .tbl { border-collapse:collapse; width:100%; }
     .tbl th { background:#0d1829; color:#64748b; font-size:10px; text-transform:uppercase;
-              letter-spacing:.06em; padding:9px 10px; white-space:nowrap; cursor:pointer;
-              user-select:none; position:sticky; top:0; z-index:1; }
+              letter-spacing:.06em; padding:9px 10px; white-space:nowrap; position:sticky;
+              top:0; z-index:1; cursor:pointer; user-select:none; }
     .tbl th:hover { color:#94a3b8; }
-    .tbl th .sort-icon { opacity:.3; margin-left:2px; font-size:9px; }
-    .tbl th.sorted-asc  .sort-icon::after { content:'▲'; opacity:1; }
-    .tbl th.sorted-desc .sort-icon::after { content:'▼'; opacity:1; }
-    .tbl th.sorted-asc  .sort-icon, .tbl th.sorted-desc .sort-icon { opacity:1; color:#3b82f6; }
+    .tbl th .si { opacity:.3; margin-left:2px; font-size:9px; }
+    .tbl th.sa .si::after { content:'▲'; opacity:1; }
+    .tbl th.sd .si::after { content:'▼'; opacity:1; }
+    .tbl th.sa .si, .tbl th.sd .si { opacity:1; color:#3b82f6; }
     .tbl td { padding:7px 10px; font-size:12px; border-bottom:1px solid rgba(30,45,69,.7); }
     .tbl tr:last-child td { border-bottom:none; }
     .tbl tbody tr:hover td { background:rgba(59,130,246,.06); }
+    .tbl tfoot td { background:#08101c; border-top:1px solid #1e2d45; font-size:12px; font-weight:700; }
 
-    /* ── Conversion bar ── */
-    .conv-bar-wrap { display:flex; align-items:center; gap:5px; justify-content:flex-end; }
-    .conv-bar-bg   { width:40px; height:4px; background:#1e2d45; border-radius:2px; flex-shrink:0; }
-    .conv-bar-fill { height:100%; border-radius:2px; transition:width .4s ease; }
-
-    /* ── Conversion text colours ── */
-    .conv-high { color:#4ade80; font-weight:700; }
-    .conv-mid  { color:#facc15; font-weight:700; }
-    .conv-low  { color:#f87171; font-weight:700; }
+    /* ── Conv bar ── */
+    .cb-wrap { display:flex; align-items:center; gap:5px; justify-content:flex-end; }
+    .cb-bg   { width:36px; height:4px; background:#1e2d45; border-radius:2px; flex-shrink:0; }
+    .cb-fill { height:100%; border-radius:2px; }
+    .ch { color:#4ade80; font-weight:700; }
+    .cm { color:#facc15; font-weight:700; }
+    .cl { color:#f87171; font-weight:700; }
 
     /* ── Badges ── */
-    .badge { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; }
     .badge-a    { background:#1d4ed830; color:#93c5fd; border:1px solid #1d4ed870; }
     .badge-b    { background:#15803d30; color:#86efac; border:1px solid #15803d70; }
     .badge-c    { background:#9d174d30; color:#f9a8d4; border:1px solid #9d174d70; }
     .badge-d    { background:#92400e30; color:#fcd34d; border:1px solid #92400e70; }
     .badge-baza { background:#5b21b630; color:#c4b5fd; border:1px solid #5b21b670; }
     .badge-def  { background:#33415530; color:#94a3b8; border:1px solid #33415570; }
+    .badge      { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:700; }
+
+    /* ── Status badges ── */
+    .live-badge { background:#7f1d1d50; color:#fca5a5; border:1px solid #7f1d1d; border-radius:6px;
+                  padding:3px 9px; font-size:11px; font-weight:700; }
+    .snap-badge { background:#14532d50; color:#86efac; border:1px solid #14532d; border-radius:6px;
+                  padding:3px 9px; font-size:11px; font-weight:700; }
 
     /* ── Buttons ── */
-    .btn { padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:all .15s; border:1px solid transparent; }
+    .btn { padding:6px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer;
+           transition:all .15s; border:1px solid transparent; }
     .btn-primary { background:#2563eb; color:#fff; border-color:#2563eb; }
     .btn-primary:hover { background:#1d4ed8; }
     .btn-outline { background:transparent; border:1px solid #1e2d45; color:#64748b; }
@@ -904,28 +804,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     .btn-active-c    { background:#9d174d !important; color:#fce7f3 !important; border-color:#9d174d !important; }
     .btn-active-d    { background:#92400e !important; color:#fde68a !important; border-color:#92400e !important; }
     .btn-active-baza { background:#5b21b6 !important; color:#ede9fe !important; border-color:#5b21b6 !important; }
-    .btn-active-pr   { background:#0e7490 !important; color:#a5f3fc !important; border-color:#0e7490 !important; }
 
     /* ── Summary cards ── */
-    .scard { border-radius:14px; padding:18px 20px; display:flex; align-items:center; gap:14px; }
-    .scard-icon { width:42px; height:42px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:19px; flex-shrink:0; }
-    .scard-val  { font-size:24px; font-weight:700; line-height:1.1; font-variant-numeric:tabular-nums; }
-    .scard-lbl  { font-size:11px; color:#64748b; margin-top:2px; }
+    .scard { border-radius:14px; padding:16px 18px; display:flex; align-items:center; gap:12px; }
+    .scard-icon { width:40px; height:40px; border-radius:10px; display:flex; align-items:center;
+                  justify-content:center; font-size:18px; flex-shrink:0; }
+    .scard-val { font-size:22px; font-weight:700; line-height:1.1; font-variant-numeric:tabular-nums; }
+    .scard-lbl { font-size:11px; color:#64748b; margin-top:2px; }
 
     /* ── Skeleton ── */
     .skeleton { background:linear-gradient(90deg,#151f32 25%,#1e2d45 50%,#151f32 75%);
                 background-size:200% 100%; animation:shimmer 1.4s infinite; border-radius:8px; }
     @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
-
-    /* ── Spinner ── */
     .spinner { border:3px solid #1e2d45; border-top-color:#3b82f6; border-radius:50%;
-               width:24px; height:24px; animation:spin .7s linear infinite; }
+               width:22px; height:22px; animation:spin .7s linear infinite; }
     @keyframes spin { to { transform:rotate(360deg); } }
 
     /* ── Rank medals ── */
-    .rank-1 { color:#facc15; font-size:14px; }
-    .rank-2 { color:#94a3b8; font-size:14px; }
-    .rank-3 { color:#c2722a; font-size:14px; }
+    .rk1 { color:#facc15; } .rk2 { color:#94a3b8; } .rk3 { color:#c2722a; }
 
     /* ── Inputs ── */
     input[type="date"], input[type="text"] {
@@ -934,50 +830,41 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     }
     input[type="date"]:focus, input[type="text"]:focus { outline:none; border-color:#3b82f6; }
 
-    /* ── Grid layout ── */
-    #groups-container { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; align-items:start; }
-    #groups-container.single-group    { grid-template-columns:1fr; }
-    #groups-container.single-group .tbl-scroll { max-height:680px; }
-    #groups-container.two-groups      { grid-template-columns:repeat(2,1fr); }
-    #groups-container.three-groups    { grid-template-columns:repeat(3,1fr); }
-    .group-card.hidden-group { display:none; }
+    /* ── Grid ── */
+    #gc { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; align-items:start; }
+    #gc.g1 { grid-template-columns:1fr; }
+    #gc.g2 { grid-template-columns:repeat(2,1fr); }
+    #gc.g3 { grid-template-columns:repeat(3,1fr); }
+    .gc-card.hidden-gc { display:none; }
 
-    /* ── Table max-height scroll ── */
     .tbl-scroll { max-height:480px; overflow-y:auto; }
     ::-webkit-scrollbar { width:4px; height:4px; }
     ::-webkit-scrollbar-track { background:#0b1120; }
     ::-webkit-scrollbar-thumb { background:#1e2d45; border-radius:2px; }
     ::-webkit-scrollbar-thumb:hover { background:#334155; }
-
-    /* ── Tooltip ── */
-    [data-tip] { position:relative; }
-    [data-tip]:hover::after {
-      content:attr(data-tip); position:absolute; bottom:calc(100% + 4px); left:50%; transform:translateX(-50%);
-      background:#1e2d45; color:#e2e8f0; font-size:11px; padding:4px 8px; border-radius:6px;
-      white-space:nowrap; z-index:99; pointer-events:none;
-    }
   </style>
 </head>
 <body class="min-h-screen p-4 md:p-6">
 
   <!-- ── Header ── -->
-  <div class="flex items-start justify-between mb-6 gap-4">
+  <div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
     <div>
       <div class="flex items-center gap-2.5 mb-0.5">
-        <div class="w-8 h-8 rounded-lg bg-blue-600/20 flex items-center justify-center text-blue-400 text-lg">📊</div>
-        <h1 class="text-xl font-bold text-white tracking-tight">Staff KPI Dashboard</h1>
+        <div class="w-8 h-8 rounded-lg bg-blue-600/20 flex items-center justify-content:center text-blue-400 text-lg flex items-center justify-center">📊</div>
+        <h1 class="text-xl font-bold text-white tracking-tight">Manager KPI Dashboard</h1>
       </div>
-      <p class="text-slate-500 text-xs ml-10">amoCRM — реальное время</p>
+      <p class="text-slate-500 text-xs ml-10">amoCRM — данные из снепшотов + live kpi_events</p>
     </div>
-    <div class="flex items-center gap-2.5 flex-wrap justify-end">
+    <div class="flex items-center gap-2 flex-wrap justify-end">
+      <span id="data-badge"></span>
       <div id="spinner" class="spinner hidden"></div>
-      <span id="last-updated" class="text-slate-600 text-xs hidden sm:inline"></span>
+      <span id="last-upd" class="text-slate-600 text-xs hidden sm:inline"></span>
       <button id="btn-refresh" class="btn btn-outline text-xs py-1.5" onclick="loadStats(true)">↻ Обновить</button>
-      <button id="btn-export"  class="btn btn-outline text-xs py-1.5" style="border-color:#22c55e55;color:#86efac" onclick="exportXlsx()">↓ XLSX</button>
+      <button class="btn btn-outline text-xs py-1.5" style="border-color:#22c55e55;color:#86efac" onclick="exportXlsx()">↓ XLSX</button>
       <a href="/logout" class="btn btn-outline text-xs py-1.5" style="border-color:#47556944;color:#64748b;text-decoration:none">→ Выйти</a>
       <label class="flex items-center gap-1.5 text-slate-500 text-xs cursor-pointer select-none">
-        <input type="checkbox" id="auto-refresh" class="accent-blue-500" onchange="toggleAutoRefresh()" />
-        Авто 5 мин
+        <input type="checkbox" id="auto-ref" class="accent-blue-500" onchange="toggleAutoRef()" />
+        Авто 60 с
       </label>
     </div>
   </div>
@@ -990,12 +877,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div>
       <label class="block text-[10px] text-slate-500 mb-1 uppercase tracking-wide">До</label>
-      <input type="date" id="f-to"   style="width:140px" />
+      <input type="date" id="f-to" style="width:140px" />
     </div>
     <div class="flex gap-1.5 self-end pb-0.5">
-      <button id="preset-today" class="btn-preset active" onclick="setPreset('today',this)">Сегодня</button>
-      <button id="preset-week"  class="btn-preset"        onclick="setPreset('week', this)">Неделя</button>
-      <button id="preset-month" class="btn-preset"        onclick="setPreset('month',this)">Месяц</button>
+      <button class="btn-preset active" onclick="presetDay(this)">Сегодня</button>
+      <button class="btn-preset" onclick="presetWeek(this)">Неделя</button>
+      <button class="btn-preset" onclick="presetMonth(this)">Месяц</button>
     </div>
     <button class="btn btn-primary self-end" onclick="loadStats()">Применить</button>
 
@@ -1003,27 +890,25 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
     <div class="self-end">
       <label class="block text-[10px] text-slate-500 mb-1 uppercase tracking-wide">Группа</label>
-      <div class="flex gap-1 flex-wrap" id="group-btns">
-        <button class="btn btn-outline btn-active text-xs py-1" data-g="" onclick="setGroup(this,'')">Все</button>
-        <button class="btn btn-outline text-xs py-1" data-g="A"    onclick="setGroup(this,'A')">A</button>
-        <button class="btn btn-outline text-xs py-1" data-g="B"    onclick="setGroup(this,'B')">B</button>
-        <button class="btn btn-outline text-xs py-1" data-g="C"    onclick="setGroup(this,'C')">C</button>
-        <button class="btn btn-outline text-xs py-1" data-g="D"    onclick="setGroup(this,'D')">D</button>
-        <button class="btn btn-outline text-xs py-1" data-g="Baza" onclick="setGroup(this,'Baza')">Baza</button>
-        <button class="btn btn-outline text-xs py-1" data-g="__pr__" onclick="setGroup(this,'__pr__')">Приемщики</button>
+      <div id="grp-btns" class="flex gap-1 flex-wrap">
+        <button class="btn btn-outline btn-active text-xs py-1" data-g="" onclick="setGrp(this,'')">Все</button>
+        <button class="btn btn-outline text-xs py-1" data-g="A"    onclick="setGrp(this,'A')">A</button>
+        <button class="btn btn-outline text-xs py-1" data-g="B"    onclick="setGrp(this,'B')">B</button>
+        <button class="btn btn-outline text-xs py-1" data-g="C"    onclick="setGrp(this,'C')">C</button>
+        <button class="btn btn-outline text-xs py-1" data-g="D"    onclick="setGrp(this,'D')">D</button>
+        <button class="btn btn-outline text-xs py-1" data-g="Baza" onclick="setGrp(this,'Baza')">Baza</button>
       </div>
     </div>
 
     <div class="flex-1 min-w-[150px] self-end">
       <label class="block text-[10px] text-slate-500 mb-1 uppercase tracking-wide">Поиск сотрудника</label>
-      <input type="text" id="f-staff" placeholder="Введите имя…" oninput="filterStaff()"
-             style="width:100%" />
+      <input type="text" id="f-staff" placeholder="Имя или код…" oninput="filterStaff()" style="width:100%" />
     </div>
   </div>
 
   <!-- ── Summary Cards ── -->
-  <div id="summary-area" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-5">
-    <!-- skeleton while loading first time -->
+  <div id="sum-area" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+    <div class="skeleton h-20 rounded-xl"></div>
     <div class="skeleton h-20 rounded-xl"></div>
     <div class="skeleton h-20 rounded-xl"></div>
     <div class="skeleton h-20 rounded-xl"></div>
@@ -1032,34 +917,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <!-- ── Group Tables ── -->
-  <div id="groups-container" class="mb-5">
-    <!-- Skeleton grid while loading -->
-    <div id="skeleton-grid" class="grid grid-cols-2 md:grid-cols-4 gap-3">
+  <div id="gc" class="mb-5">
+    <div id="sk-grid" class="grid grid-cols-2 md:grid-cols-4 gap-3">
       <div class="skeleton h-64 rounded-xl"></div>
       <div class="skeleton h-64 rounded-xl"></div>
       <div class="skeleton h-64 rounded-xl"></div>
       <div class="skeleton h-64 rounded-xl"></div>
     </div>
-  </div>
-
-  <!-- ── Приемщик Section ── -->
-  <div id="priemshchik-section" class="hidden mb-5">
-    <div class="flex items-center gap-2 mb-3">
-      <span class="text-lg">👤</span>
-      <h2 class="text-white font-semibold text-base">Статистика Приемщиков</h2>
-    </div>
-    <div id="priemshchik-container" class="card overflow-hidden"></div>
   </div>
 
   <!-- ── Error ── -->
-  <div id="error-banner" class="hidden mb-4 card p-4 flex items-start gap-3"
+  <div id="err-banner" class="hidden mb-4 card p-4 flex items-start gap-3"
        style="border-color:#7f1d1d;background:rgba(127,29,29,.2)">
     <span class="text-red-400 text-base flex-shrink-0">⚠</span>
     <div class="flex-1 min-w-0">
       <div class="text-red-300 font-semibold text-sm">Ошибка загрузки</div>
-      <div id="error-text" class="text-red-400/80 text-xs mt-0.5 break-all"></div>
+      <div id="err-text" class="text-red-400/80 text-xs mt-0.5 break-all"></div>
     </div>
-    <button onclick="clearError()" class="text-red-500 hover:text-red-300 text-base flex-shrink-0">✕</button>
+    <button onclick="clearErr()" class="text-red-500 hover:text-red-300">✕</button>
   </div>
 
   <div id="empty-msg" class="hidden text-center text-slate-600 py-20 text-base">
@@ -1071,11 +946,24 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </p>
 
 <script>
-// ── State ────────────────────────────────────────────────────────────────────
-let activeGroup  = '';
-let autoTimer    = null;
-let cachedData   = null;
-let sortState    = {};   // tableId → { col, dir }
+// ── State ─────────────────────────────────────────────────────────────────────
+let activeGrp = '';
+let autoTimer = null;
+let sortState = {};   // tableId → {col, dir}
+
+// ── Column definitions ─────────────────────────────────────────────────────────
+// Columns: # | Код | Сотрудник | Olag | Zakaz Soni | Zakaz Konv.% | Qilingan Summa | Uspeshka Summas | Uspeshka Konv.%
+const COLS = [
+  { key:'num',           label:'#',              align:'left',  fmt: v => v },
+  { key:'code',          label:'Код',            align:'right', fmt: v => `<span class="text-slate-500 text-[10px]">${v}</span>` },
+  { key:'name',          label:'Сотрудник',      align:'left',  fmt: v => `<span class="text-slate-200 font-medium">${v}</span>` },
+  { key:'consul',        label:'Olag',           align:'right', fmt: v => `<span class="text-blue-300 font-semibold">${v}</span>` },
+  { key:'zakas',         label:'Zakaz Soni',     align:'right', fmt: v => `<span class="text-green-400 font-semibold">${v}</span>` },
+  { key:'zakaz_conv',    label:'Zakaz Konv.%',   align:'right', fmt: v => convBar(v) },
+  { key:'summa',         label:'Qilingan Summa', align:'right', fmt: v => `<span class="text-yellow-400 font-semibold">${fmtMoney(v)}</span>` },
+  { key:'uspeshka_summa',label:'Uspeshka Summas',align:'right', fmt: v => `<span class="text-emerald-400 font-semibold">${fmtMoney(v)}</span>` },
+  { key:'uspeshka_conv', label:'Uspeshka Konv.%',align:'right', fmt: v => convBar(v) },
+];
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 (function init() {
@@ -1085,389 +973,287 @@ let sortState    = {};   // tableId → { col, dir }
   loadStats();
 })();
 
-// ── Date presets ─────────────────────────────────────────────────────────────
-function setPreset(p, btn) {
-  const today = new Date();
-  let from = new Date(today), to = new Date(today);
-  if (p === 'week') {
-    const day = today.getDay() || 7;
-    from.setDate(today.getDate() - day + 1);
-  } else if (p === 'month') {
-    from = new Date(today.getFullYear(), today.getMonth(), 1);
-  }
-  document.getElementById('f-from').value = from.toISOString().slice(0,10);
-  document.getElementById('f-to').value   = to.toISOString().slice(0,10);
-  document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  loadStats();
+// ── Date presets ──────────────────────────────────────────────────────────────
+function clearPresets() { document.querySelectorAll('.btn-preset').forEach(b => b.classList.remove('active')); }
+function presetDay(b)  { clearPresets(); b.classList.add('active'); const t=isoToday(); setDates(t,t); loadStats(); }
+function presetWeek(b) {
+  clearPresets(); b.classList.add('active');
+  const t=new Date(); const day=t.getDay()||7;
+  const mn=new Date(t); mn.setDate(t.getDate()-day+1);
+  setDates(mn.toISOString().slice(0,10), isoToday()); loadStats();
+}
+function presetMonth(b) {
+  clearPresets(); b.classList.add('active');
+  const t=new Date(); const mn=new Date(t.getFullYear(),t.getMonth(),1);
+  setDates(mn.toISOString().slice(0,10), isoToday()); loadStats();
+}
+function isoToday() { return new Date().toISOString().slice(0,10); }
+function setDates(f,t) {
+  document.getElementById('f-from').value=f;
+  document.getElementById('f-to').value=t;
 }
 
-// ── Group filter ──────────────────────────────────────────────────────────────
-const G_ACTIVE = {'':'btn-active',A:'btn-active-a',B:'btn-active-b',C:'btn-active-c',D:'btn-active-d',Baza:'btn-active-baza','__pr__':'btn-active-pr'};
-
-function setGroup(btn, g) {
-  activeGroup = g;
-  document.querySelectorAll('#group-btns .btn').forEach(b =>
-    b.classList.remove('btn-active','btn-active-a','btn-active-b','btn-active-c','btn-active-d','btn-active-baza','btn-active-pr'));
-  btn.classList.add(G_ACTIVE[g] || 'btn-active');
-  applyGroupVisibility();
+// ── Group filter ────────────────────────────────────────────────────────────
+const G_ACT = {'':'btn-active',A:'btn-active-a',B:'btn-active-b',C:'btn-active-c',D:'btn-active-d',Baza:'btn-active-baza'};
+function setGrp(btn, g) {
+  activeGrp = g;
+  document.querySelectorAll('#grp-btns .btn').forEach(b =>
+    b.classList.remove('btn-active','btn-active-a','btn-active-b','btn-active-c','btn-active-d','btn-active-baza'));
+  btn.classList.add(G_ACT[g]||'btn-active');
+  applyGrpVis();
 }
 
-function applyGroupVisibility() {
-  const container = document.getElementById('groups-container');
-  const cards     = container.querySelectorAll('.group-card');
-  const ps        = document.getElementById('priemshchik-section');
-  const isPr      = activeGroup === '__pr__';
-
-  // Приемщики mode: hide all group cards, show only priemshchik section
-  if (isPr) {
-    cards.forEach(c => c.classList.add('hidden-group'));
-    container.classList.remove('single-group','two-groups','three-groups');
-    if (ps) ps.classList.remove('hidden');
-    filterStaff();
-    return;
-  }
-
-  // Normal group filter
-  let visible = 0;
+function applyGrpVis() {
+  const cards = document.querySelectorAll('.gc-card');
+  let vis = 0;
   cards.forEach(c => {
-    const show = !activeGroup || c.dataset.group.toUpperCase() === activeGroup.toUpperCase();
-    c.classList.toggle('hidden-group', !show);
-    if (show) visible++;
+    const show = !activeGrp || c.dataset.group.toUpperCase() === activeGrp.toUpperCase();
+    c.classList.toggle('hidden-gc', !show);
+    if (show) vis++;
   });
-  container.classList.remove('single-group','two-groups','three-groups');
-  if (visible === 1)      container.classList.add('single-group');
-  else if (visible === 2) container.classList.add('two-groups');
-  else if (visible === 3) container.classList.add('three-groups');
-  // Приемщик table only visible in "Все" mode
-  if (ps) ps.classList.toggle('hidden', !!activeGroup);
+  const gc = document.getElementById('gc');
+  gc.classList.remove('g1','g2','g3');
+  if (vis===1) gc.classList.add('g1');
+  else if (vis===2) gc.classList.add('g2');
+  else if (vis===3) gc.classList.add('g3');
   filterStaff();
 }
 
 // ── Auto-refresh ──────────────────────────────────────────────────────────────
-function toggleAutoRefresh() {
+function toggleAutoRef() {
   clearInterval(autoTimer);
-  if (document.getElementById('auto-refresh').checked)
-    autoTimer = setInterval(loadStats, 5*60*1000);
+  if (document.getElementById('auto-ref').checked)
+    autoTimer = setInterval(() => loadStats(false), 60_000);
 }
 
-// ── Load stats ───────────────────────────────────────────────────────────────
-async function loadStats(force = false) {
+// ── Load stats ────────────────────────────────────────────────────────────────
+async function loadStats(force=false) {
   const from = document.getElementById('f-from').value;
   const to   = document.getElementById('f-to').value;
   document.getElementById('spinner').classList.remove('hidden');
   document.getElementById('btn-refresh').disabled = true;
-
   try {
-    const forceParam = force ? '&force=1' : '';
-    const res  = await fetch(`/api/dashboard/stats?date_from=${from}&date_to=${to}${forceParam}`);
-    const ct   = res.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      showError(`Ошибка ${res.status}: ${(await res.text()).slice(0,200)}`); return;
-    }
+    const fp = force ? '&force=1' : '';
+    const res = await fetch(`/api/dashboard/stats?date_from=${from}&date_to=${to}${fp}`);
+    if (!res.ok) { showErr(`HTTP ${res.status}`); return; }
     const data = await res.json();
-    if (data.error) { showError('API: ' + data.error); return; }
-    clearError();
-    cachedData = data;
+    if (data.error) { showErr(data.error); return; }
+    clearErr();
+    renderBadge(data);
     renderSummary(data);
     renderGroups(data);
-    renderPriemshchik(data);
-    applyGroupVisibility();
+    applyGrpVis();
     filterStaff();
     const now = new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    const lu  = document.getElementById('last-updated');
-    lu.textContent = 'Обновлено ' + now;
-    lu.classList.remove('hidden');
-  } catch(e) {
-    showError('Ошибка: ' + e);
-  } finally {
+    const lu = document.getElementById('last-upd');
+    lu.textContent = 'Обновлено '+now; lu.classList.remove('hidden');
+    // Enable auto-refresh only for live data
+    if (data.is_live && document.getElementById('auto-ref').checked) {
+      clearInterval(autoTimer);
+      autoTimer = setInterval(() => loadStats(false), 60_000);
+    }
+  } catch(e) { showErr(e.toString()); }
+  finally {
     document.getElementById('spinner').classList.add('hidden');
     document.getElementById('btn-refresh').disabled = false;
   }
 }
 
+// ── Data-source badge ─────────────────────────────────────────────────────────
+function renderBadge(data) {
+  const el = document.getElementById('data-badge');
+  el.innerHTML = data.is_live
+    ? '<span class="live-badge">🔴 LIVE — kpi_events</span>'
+    : '<span class="snap-badge">🟢 Snapshot</span>';
+}
+
 // ── Summary cards ─────────────────────────────────────────────────────────────
-const SCARD_DEFS = [
-  { id:'s-consul', icon:'💬', label:'Консультации', color:'#1e3a5f', iconBg:'#1d4ed820', iconColor:'#60a5fa' },
-  { id:'s-zakas',  icon:'✅', label:'Заказы',       color:'#14532d', iconBg:'#15803d20', iconColor:'#4ade80' },
-  { id:'s-otkaz',  icon:'✕',  label:'Отказы',       color:'#450a0a', iconBg:'#7f1d1d20', iconColor:'#f87171' },
-  { id:'s-summa',  icon:'₸',  label:'Сумма заказов',color:'#422006', iconBg:'#92400e20', iconColor:'#fbbf24' },
-  { id:'s-conv',   icon:'%',  label:'Конверсия',     color:'#2e1065', iconBg:'#5b21b620', iconColor:'#c4b5fd' },
+const SCARDS = [
+  { lbl:'Olag (Consul)',      color:'#1e3a5f', ic:'💬', icBg:'#1d4ed820', icCol:'#60a5fa',  key:'total_consul' },
+  { lbl:'Zakaz Soni',        color:'#14532d', ic:'✅', icBg:'#15803d20', icCol:'#4ade80',  key:'total_zakas' },
+  { lbl:'Zakaz Konv.%',      color:'#2e1065', ic:'%',  icBg:'#5b21b620', icCol:'#c4b5fd',  key:'avg_zakaz_conv', sfx:'%' },
+  { lbl:'Qilingan Summa',    color:'#422006', ic:'₸',  icBg:'#92400e20', icCol:'#fbbf24',  key:'total_summa' },
+  { lbl:'Uspeshka Summas',   color:'#064e3b', ic:'🏆', icBg:'#06532520', icCol:'#34d399',  key:'total_uspeshka_summa' },
+  { lbl:'Uspeshka Konv.%',   color:'#134e4a', ic:'📈', icBg:'#0f766e20', icCol:'#2dd4bf',  key:'avg_uspeshka_conv', sfx:'%' },
 ];
 
 function renderSummary(data) {
-  const vals = {
-    's-consul': fmtNum(data.total_consul),
-    's-zakas':  fmtNum(data.total_zakas),
-    's-otkaz':  fmtNum(data.total_otkaz || 0),
-    's-summa':  fmtMoney(data.total_summa),
-    's-conv':   data.avg_conversion + '%',
-  };
-  const area = document.getElementById('summary-area');
-  area.innerHTML = SCARD_DEFS.map(d => `
-    <div class="scard" style="background:${d.color}30;border:1px solid ${d.color}80">
-      <div class="scard-icon" style="background:${d.iconBg};color:${d.iconColor}">${d.icon}</div>
-      <div>
-        <div class="scard-val" style="color:${d.iconColor}">${vals[d.id]}</div>
-        <div class="scard-lbl">${d.label}</div>
-      </div>
-    </div>`).join('');
+  document.getElementById('sum-area').innerHTML = SCARDS.map(s => {
+    const raw = data[s.key] ?? 0;
+    const val = s.key === 'total_summa' || s.key === 'total_uspeshka_summa'
+      ? fmtMoney(raw)
+      : (raw + (s.sfx||''));
+    return `<div class="scard" style="background:${s.color}30;border:1px solid ${s.color}80">
+      <div class="scard-icon" style="background:${s.icBg};color:${s.icCol}">${s.ic}</div>
+      <div><div class="scard-val" style="color:${s.icCol}">${val}</div>
+           <div class="scard-lbl">${s.lbl}</div></div>
+    </div>`;
+  }).join('');
 }
 
 // ── Group tables ──────────────────────────────────────────────────────────────
-const G_BADGE = { A:'badge-a', B:'badge-b', C:'badge-c', D:'badge-d', BAZA:'badge-baza' };
-const G_HDR   = { A:'ghdr-a',  B:'ghdr-b',  C:'ghdr-c',  D:'ghdr-d',  BAZA:'ghdr-baza' };
-const COLS    = ['num','name','summa','zakas','dumka','otkaz','consul','conversion'];
-const COL_KEY = { 2:'summa', 3:'zakas', 4:'dumka', 5:'otkaz', 6:'consul', 7:'conversion' };
+const G_HDR   = {A:'ghdr-a',B:'ghdr-b',C:'ghdr-c',D:'ghdr-d',BAZA:'ghdr-baza'};
+const G_BADGE = {A:'badge-a',B:'badge-b',C:'badge-c',D:'badge-d',BAZA:'badge-baza'};
 
 function renderGroups(data) {
-  const container = document.getElementById('groups-container');
-  const emptyMsg  = document.getElementById('empty-msg');
-
-  // Remove any skeleton left-over
-  const sk = document.getElementById('skeleton-grid');
+  const gc = document.getElementById('gc');
+  const sk = document.getElementById('sk-grid');
   if (sk) sk.remove();
-
-  container.innerHTML = '';
-  document.querySelectorAll('.group-card').forEach(c => c.remove());
+  gc.innerHTML = '';
 
   const groups = data.groups || {};
   const ORDER  = ['A','B','C','D','Baza'];
-  const keys   = [...ORDER.filter(k => groups[k]), ...Object.keys(groups).filter(k => !ORDER.includes(k)).sort()];
+  const keys   = [...ORDER.filter(k=>groups[k]), ...Object.keys(groups).filter(k=>!ORDER.includes(k)).sort()];
 
-  if (!keys.length) { emptyMsg.classList.remove('hidden'); return; }
-  emptyMsg.classList.add('hidden');
+  const emMsg = document.getElementById('empty-msg');
+  if (!keys.length) { emMsg.classList.remove('hidden'); return; }
+  emMsg.classList.add('hidden');
 
   for (const g of keys) {
-    const rows     = groups[g];
-    const gUp      = g.toUpperCase();
-    const badgeCls = G_BADGE[gUp] || 'badge-def';
-    const hdrCls   = G_HDR[gUp]   || 'ghdr-def';
-    const tc = rows.reduce((s,r)=>s+r.consul,0);
-    const tz = rows.reduce((s,r)=>s+r.zakas, 0);
-    const to = rows.reduce((s,r)=>s+(r.otkaz||0),0);
-    const td = rows.reduce((s,r)=>s+(r.dumka||0),0);
-    const ts = rows.reduce((s,r)=>s+r.summa, 0);
-    const tv = tc ? +(tz/tc*100).toFixed(1) : 0;
-    const tableId = 'tbl-' + g;
+    const rows    = groups[g];
+    const gUp     = g.toUpperCase();
+    const bCls    = G_BADGE[gUp] || 'badge-def';
+    const hCls    = G_HDR[gUp]   || 'ghdr-def';
+    const tid     = 'tbl-'+g;
+
+    // Totals
+    const tc  = rows.reduce((s,r)=>s+r.consul,0);
+    const tz  = rows.reduce((s,r)=>s+r.zakas,0);
+    const ts  = rows.reduce((s,r)=>s+r.summa,0);
+    const tus = rows.reduce((s,r)=>s+(r.uspeshka_summa||0),0);
+    const tzc = tc ? +(tz/tc*100).toFixed(1) : 0;
+    const tuc = ts ? +(tus/ts*100).toFixed(1) : 0;
 
     const card = document.createElement('div');
-    card.className   = 'card overflow-hidden group-card';
+    card.className   = 'card overflow-hidden gc-card';
     card.dataset.group = g;
 
     card.innerHTML = `
-      <div class="${hdrCls} px-3 py-2.5 flex items-center justify-between">
+      <div class="${hCls} px-3 py-2.5 flex items-center justify-between">
         <span class="font-semibold text-white text-sm flex items-center gap-2">
-          <span class="badge ${badgeCls}">${g}</span>
+          <span class="badge ${bCls}">${g}</span>
           Отдел ${g}
         </span>
         <span class="text-xs text-slate-400">${rows.length} чел.</span>
       </div>
       <div class="tbl-scroll">
-        <table class="tbl" id="${tableId}">
+        <table class="tbl" id="${tid}">
           <thead><tr>
-            <th class="text-left w-6" data-col="0"                   >#<span class="sort-icon"></span></th>
-            <th class="text-left"     data-col="1"                   >Сотрудник<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="2" data-key="summa"  >Сумма<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="3" data-key="zakas"  >Заказ<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="4" data-key="dumka"  >Думка<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="5" data-key="otkaz"  >Отказ<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="6" data-key="consul" >Консульт.<span class="sort-icon"></span></th>
-            <th class="text-right"    data-col="7" data-key="conv"   >Конв.<span class="sort-icon"></span></th>
+            ${COLS.map((c,i)=>`<th class="text-${c.align}" data-col="${i}" data-key="${c.key}"
+              >${c.label}<span class="si"></span></th>`).join('')}
           </tr></thead>
-          <tbody>${buildRows(rows, tableId)}</tbody>
-          <tfoot>
-            <tr style="background:#08101c;border-top:1px solid #1e2d45">
-              <td colspan="2" class="px-2.5 py-2 text-xs text-slate-400 font-semibold">Итого</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold text-yellow-400">${fmtMoney(ts)}</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold text-green-400">${tz}</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold text-slate-400">${td}</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold text-red-400">${to}</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold text-blue-400">${tc}</td>
-              <td class="px-2.5 py-2 text-right text-xs font-bold ${convCls(tv)}">${convBar(tv)}</td>
-            </tr>
-          </tfoot>
+          <tbody>${buildRows(rows)}</tbody>
+          <tfoot><tr>
+            <td colspan="3" class="px-2.5 py-2 text-xs text-slate-400">Итого</td>
+            <td class="px-2.5 py-2 text-right text-blue-400">${tc}</td>
+            <td class="px-2.5 py-2 text-right text-green-400">${tz}</td>
+            <td class="px-2.5 py-2 text-right">${convBar(tzc)}</td>
+            <td class="px-2.5 py-2 text-right text-yellow-400">${fmtMoney(ts)}</td>
+            <td class="px-2.5 py-2 text-right text-emerald-400">${fmtMoney(tus)}</td>
+            <td class="px-2.5 py-2 text-right">${convBar(tuc)}</td>
+          </tr></tfoot>
         </table>
       </div>`;
 
-    // bind sort
     card.querySelectorAll('th[data-col]').forEach(th => {
-      th.addEventListener('click', () => sortTable(tableId, parseInt(th.dataset.col), th.dataset.key));
+      th.addEventListener('click', () => sortTbl(tid, parseInt(th.dataset.col)));
     });
-
-    container.appendChild(card);
+    gc.appendChild(card);
   }
 }
 
-function buildRows(rows, tableId) {
-  // rows should already be sorted by summa desc from server; assign rank within that
+function buildRows(rows) {
   return rows.map((r, idx) => {
-    const rank      = idx + 1;
-    const rankHtml  = rank === 1 ? '<span class="rank-1">🥇</span>'
-                    : rank === 2 ? '<span class="rank-2">🥈</span>'
-                    : rank === 3 ? '<span class="rank-3">🥉</span>'
-                    : `<span class="text-slate-600 text-[10px]">${rank}</span>`;
-    return `<tr class="staff-row" data-name="${r.name.toLowerCase()}"
-               data-summa="${r.summa}" data-zakas="${r.zakas}" data-dumka="${r.dumka||0}"
-               data-otkaz="${r.otkaz||0}" data-consul="${r.consul}" data-conv="${r.conversion}">
-      <td class="pl-2.5 pr-1 w-7">${rankHtml}</td>
-      <td>
-        <div class="font-medium text-slate-200 text-xs leading-tight">${r.name}</div>
-        ${r.code ? `<div class="text-slate-600 text-[10px]">код ${r.code}</div>` : ''}
-      </td>
-      <td class="text-right font-semibold text-xs text-yellow-400">${fmtMoney(r.summa)}</td>
-      <td class="text-right font-semibold text-xs text-green-400">${r.zakas}</td>
-      <td class="text-right text-xs text-slate-400">${r.dumka||0}</td>
-      <td class="text-right text-xs text-red-400">${r.otkaz||0}</td>
-      <td class="text-right text-xs text-blue-300">${r.consul}</td>
-      <td class="text-right text-xs">${convBar(r.conversion)}</td>
-    </tr>`;
+    const rank = idx+1;
+    const rk   = rank===1?'<span class="rk1">🥇</span>'
+               : rank===2?'<span class="rk2">🥈</span>'
+               : rank===3?'<span class="rk3">🥉</span>'
+               : `<span class="text-slate-600 text-[10px]">${rank}</span>`;
+    const cells = COLS.map((c,i) => {
+      let raw = r[c.key] ?? 0;
+      let html = (i===0) ? rk : c.fmt(raw);
+      return `<td class="text-${c.align}">${html}</td>`;
+    }).join('');
+    return `<tr class="staff-row"
+      data-name="${(r.name||'').toLowerCase()}"
+      data-code="${r.code||''}"
+      data-consul="${r.consul||0}"
+      data-zakas="${r.zakas||0}"
+      data-zakaz_conv="${r.zakaz_conv||0}"
+      data-summa="${r.summa||0}"
+      data-uspeshka_summa="${r.uspeshka_summa||0}"
+      data-uspeshka_conv="${r.uspeshka_conv||0}">${cells}</tr>`;
   }).join('');
 }
 
 // ── Sort ──────────────────────────────────────────────────────────────────────
-function sortTable(tableId, colIdx, key) {
-  const table  = document.getElementById(tableId);
+function sortTbl(tid, colIdx) {
+  const table = document.getElementById(tid);
   if (!table) return;
-  const prev   = sortState[tableId] || { col:-1, dir:'desc' };
-  const dir    = (prev.col === colIdx && prev.dir === 'desc') ? 'asc' : 'desc';
-  sortState[tableId] = { col:colIdx, dir };
+  const prev = sortState[tid] || {col:-1, dir:'desc'};
+  const dir  = (prev.col===colIdx && prev.dir==='desc') ? 'asc' : 'desc';
+  sortState[tid] = {col:colIdx, dir};
 
-  // Update header icons
   table.querySelectorAll('th').forEach(th => {
-    th.classList.remove('sorted-asc','sorted-desc');
-    if (parseInt(th.dataset.col) === colIdx) th.classList.add(dir==='asc'?'sorted-asc':'sorted-desc');
+    th.classList.remove('sa','sd');
+    if (parseInt(th.dataset.col)===colIdx) th.classList.add(dir==='asc'?'sa':'sd');
   });
 
   const tbody = table.querySelector('tbody');
-  const rows  = Array.from(tbody.querySelectorAll('tr.staff-row'));
+  const trows = Array.from(tbody.querySelectorAll('tr.staff-row'));
+  const key   = COLS[colIdx]?.key;
 
-  const dataAttr = {2:'summa',3:'zakas',4:'dumka',5:'otkaz',6:'consul',7:'conv'}[colIdx];
-
-  rows.sort((a, b) => {
-    let av, bv;
-    if (colIdx === 1) {
-      av = a.dataset.name; bv = b.dataset.name;
-      return dir==='asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+  trows.sort((a,b) => {
+    if (colIdx===2) {
+      const av=a.dataset.name, bv=b.dataset.name;
+      return dir==='asc'?av.localeCompare(bv):bv.localeCompare(av);
     }
-    if (!dataAttr) return 0;
-    av = parseFloat(a.dataset[dataAttr]||0);
-    bv = parseFloat(b.dataset[dataAttr]||0);
-    return dir==='asc' ? av-bv : bv-av;
+    const av=parseFloat(a.dataset[key]||0), bv=parseFloat(b.dataset[key]||0);
+    return dir==='asc'?av-bv:bv-av;
   });
-
-  rows.forEach(r => tbody.appendChild(r));
-}
-
-// ── Приемщик ──────────────────────────────────────────────────────────────────
-function renderPriemshchik(data) {
-  const rows      = data.priemshchik || [];
-  const section   = document.getElementById('priemshchik-section');
-  const container = document.getElementById('priemshchik-container');
-  if (!rows.length) { section.classList.add('hidden'); return; }
-  if (!activeGroup || activeGroup === '__pr__') section.classList.remove('hidden');
-
-  const tc = rows.reduce((s,r)=>s+r.consul,0);
-  const tz = rows.reduce((s,r)=>s+r.zakas, 0);
-  const to = rows.reduce((s,r)=>s+(r.otkaz||0),0);
-  const ts = rows.reduce((s,r)=>s+r.summa, 0);
-  const tv = tc ? +(tz/tc*100).toFixed(1) : 0;
-
-  container.innerHTML = `
-    <div class="ghdr-a px-3 py-2.5 flex items-center justify-between">
-      <span class="font-semibold text-white text-sm">Приемщики</span>
-      <span class="text-xs text-slate-400">${rows.length} чел.</span>
-    </div>
-    <div class="tbl-scroll">
-      <table class="tbl">
-        <thead><tr>
-          <th class="text-left w-6">#</th>
-          <th class="text-left">Приемщик</th>
-          <th class="text-right">Сумма</th>
-          <th class="text-right">Заказ</th>
-          <th class="text-right">Отказ</th>
-          <th class="text-right">Консультации</th>
-          <th class="text-right">Конв.</th>
-        </tr></thead>
-        <tbody>${rows.map((r,i) => `
-          <tr>
-            <td class="pl-2.5 text-slate-600 text-[10px]">${i+1}</td>
-            <td class="font-medium text-slate-200 text-xs">${r.name}</td>
-            <td class="text-right font-semibold text-xs text-yellow-400">${fmtMoney(r.summa)}</td>
-            <td class="text-right font-semibold text-xs text-green-400">${r.zakas}</td>
-            <td class="text-right text-xs text-red-400">${r.otkaz||0}</td>
-            <td class="text-right text-xs text-blue-300">${r.consul}</td>
-            <td class="text-right text-xs">${convBar(r.conversion)}</td>
-          </tr>`).join('')}
-        </tbody>
-        <tfoot>
-          <tr style="background:#08101c;border-top:1px solid #1e2d45">
-            <td colspan="2" class="px-2.5 py-2 text-xs text-slate-400 font-semibold">Итого</td>
-            <td class="px-2.5 py-2 text-right text-xs font-bold text-yellow-400">${fmtMoney(ts)}</td>
-            <td class="px-2.5 py-2 text-right text-xs font-bold text-green-400">${tz}</td>
-            <td class="px-2.5 py-2 text-right text-xs font-bold text-red-400">${to}</td>
-            <td class="px-2.5 py-2 text-right text-xs font-bold text-blue-400">${tc}</td>
-            <td class="px-2.5 py-2 text-right text-xs font-bold ${convCls(tv)}">${convBar(tv)}</td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>`;
+  trows.forEach(r=>tbody.appendChild(r));
 }
 
 // ── Staff search ──────────────────────────────────────────────────────────────
 function filterStaff() {
   const q = document.getElementById('f-staff').value.toLowerCase().trim();
   document.querySelectorAll('.staff-row').forEach(tr => {
-    const matchName  = !q || (tr.dataset.name||'').includes(q);
-    const matchGroup = !activeGroup ||
-      tr.closest('.group-card')?.dataset?.group?.toUpperCase() === activeGroup.toUpperCase();
-    tr.style.display = (matchName && matchGroup) ? '' : 'none';
+    const matchName = !q || (tr.dataset.name||'').includes(q) || (tr.dataset.code||'').includes(q);
+    const card = tr.closest('.gc-card');
+    const matchGrp  = !activeGrp || (card && card.dataset.group.toUpperCase()===activeGrp.toUpperCase());
+    tr.style.display = (matchName && matchGrp) ? '' : 'none';
   });
 }
 
 // ── Export ────────────────────────────────────────────────────────────────────
 function exportXlsx() {
-  const from = document.getElementById('f-from').value;
-  const to   = document.getElementById('f-to').value;
-  const grp  = activeGroup;
-  const btn  = document.getElementById('btn-export');
-  btn.disabled = true; btn.textContent = '⏳ ...';
-  fetch(`/api/dashboard/export?date_from=${from}&date_to=${to}&group=${grp}`)
-    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.blob(); })
-    .then(blob => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `KPI_${from}_${to}${grp ? '_'+grp : ''}.xlsx`;
-      a.click(); URL.revokeObjectURL(a.href);
-    })
-    .catch(e => showError('Ошибка экспорта: ' + e.message))
-    .finally(() => { btn.disabled = false; btn.textContent = '↓ XLSX'; });
+  const from=document.getElementById('f-from').value, to=document.getElementById('f-to').value;
+  const url = `/api/dashboard/export?date_from=${from}&date_to=${to}&group=${activeGrp}`;
+  fetch(url)
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.blob(); })
+    .then(blob=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+                  a.download=`KPI_${from}_${to}.xlsx`; a.click(); })
+    .catch(e=>showErr('Ошибка экспорта: '+e.message));
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
-function showError(msg) {
-  document.getElementById('error-text').textContent = msg;
-  document.getElementById('error-banner').classList.remove('hidden');
+function showErr(m) {
+  document.getElementById('err-text').textContent=m;
+  document.getElementById('err-banner').classList.remove('hidden');
 }
-function clearError() {
-  document.getElementById('error-banner').classList.add('hidden');
-}
+function clearErr() { document.getElementById('err-banner').classList.add('hidden'); }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function fmtNum(n)   { return (n||0).toLocaleString('ru-RU'); }
 function fmtMoney(n) {
   if (!n) return '0';
-  if (n >= 1_000_000) return (n/1_000_000).toFixed(1).replace('.',',') + ' млн';
-  return n.toLocaleString('ru-RU');
+  if (n>=1_000_000) return (n/1_000_000).toFixed(1).replace('.',',')+' млн';
+  return (+n).toLocaleString('ru-RU');
 }
-function convCls(v)  { return v >= 50 ? 'conv-high' : v >= 25 ? 'conv-mid' : 'conv-low'; }
-function convBar(v)  {
-  const pct  = Math.min(v, 100);
-  const col  = v >= 50 ? '#4ade80' : v >= 25 ? '#facc15' : '#f87171';
-  return `<div class="conv-bar-wrap">
-    <span class="${convCls(v)}">${v}%</span>
-    <div class="conv-bar-bg"><div class="conv-bar-fill" style="width:${pct}%;background:${col}"></div></div>
-  </div>`;
+function convCls(v) { return v>=50?'ch':v>=25?'cm':'cl'; }
+function convBar(v) {
+  const pct=Math.min(v,100), col=v>=50?'#4ade80':v>=25?'#facc15':'#f87171';
+  return `<div class="cb-wrap"><span class="${convCls(v)}">${v}%</span>
+    <div class="cb-bg"><div class="cb-fill" style="width:${pct}%;background:${col}"></div></div></div>`;
 }
 </script>
 </body>

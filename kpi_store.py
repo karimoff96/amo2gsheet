@@ -109,6 +109,24 @@ class KPIStore:
                         date_to    TEXT NOT NULL,
                         completed_at TEXT NOT NULL
                     );
+
+                    -- Frozen daily snapshots for the manager dashboard.
+                    -- Written once per day by the nightly scheduled fetch; never mutated
+                    -- after creation so past-day dashboard reads require zero AMO API calls.
+                    CREATE TABLE IF NOT EXISTS manager_snapshots (
+                        snapshot_date TEXT NOT NULL,
+                        staff_code    TEXT NOT NULL,
+                        consul        INTEGER NOT NULL DEFAULT 0,
+                        zakas         INTEGER NOT NULL DEFAULT 0,
+                        dumka         INTEGER NOT NULL DEFAULT 0,
+                        summa         REAL    NOT NULL DEFAULT 0,
+                        uspeshka      INTEGER NOT NULL DEFAULT 0,
+                        uspeshka_summa REAL   NOT NULL DEFAULT 0,
+                        otkaz         INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (snapshot_date, staff_code)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_snaps_date
+                        ON manager_snapshots (snapshot_date);
                 """)
 
     def _tz(self) -> timezone:
@@ -325,10 +343,13 @@ class KPIStore:
                 """
                 SELECT
                     staff_code,
-                    SUM(CASE WHEN event_type = 'consul' THEN 1      ELSE 0   END) AS consul,
-                    SUM(CASE WHEN event_type = 'zakas'  THEN 1      ELSE 0   END) AS zakas,
-                    SUM(CASE WHEN event_type = 'dumka'  THEN 1      ELSE 0   END) AS dumka,
-                    SUM(CASE WHEN event_type = 'zakas'  THEN budget ELSE 0.0 END) AS summa
+                    SUM(CASE WHEN event_type = 'consul'   THEN 1      ELSE 0   END) AS consul,
+                    SUM(CASE WHEN event_type = 'zakas'    THEN 1      ELSE 0   END) AS zakas,
+                    SUM(CASE WHEN event_type = 'dumka'    THEN 1      ELSE 0   END) AS dumka,
+                    SUM(CASE WHEN event_type = 'zakas'    THEN budget ELSE 0.0 END) AS summa,
+                    SUM(CASE WHEN event_type = 'uspeshka' THEN 1      ELSE 0   END) AS uspeshka,
+                    SUM(CASE WHEN event_type = 'uspeshka' THEN budget ELSE 0.0 END) AS uspeshka_summa,
+                    SUM(CASE WHEN event_type = 'otkaz'    THEN 1      ELSE 0   END) AS otkaz
                 FROM kpi_events
                 WHERE event_date BETWEEN ? AND ?
                 GROUP BY staff_code
@@ -355,10 +376,13 @@ class KPIStore:
                 SELECT
                     event_date,
                     staff_code,
-                    SUM(CASE WHEN event_type = 'consul' THEN 1      ELSE 0   END) AS consul,
-                    SUM(CASE WHEN event_type = 'zakas'  THEN 1      ELSE 0   END) AS zakas,
-                    SUM(CASE WHEN event_type = 'dumka'  THEN 1      ELSE 0   END) AS dumka,
-                    SUM(CASE WHEN event_type = 'zakas'  THEN budget ELSE 0.0 END) AS summa
+                    SUM(CASE WHEN event_type = 'consul'   THEN 1      ELSE 0   END) AS consul,
+                    SUM(CASE WHEN event_type = 'zakas'    THEN 1      ELSE 0   END) AS zakas,
+                    SUM(CASE WHEN event_type = 'dumka'    THEN 1      ELSE 0   END) AS dumka,
+                    SUM(CASE WHEN event_type = 'zakas'    THEN budget ELSE 0.0 END) AS summa,
+                    SUM(CASE WHEN event_type = 'uspeshka' THEN 1      ELSE 0   END) AS uspeshka,
+                    SUM(CASE WHEN event_type = 'uspeshka' THEN budget ELSE 0.0 END) AS uspeshka_summa,
+                    SUM(CASE WHEN event_type = 'otkaz'    THEN 1      ELSE 0   END) AS otkaz
                 FROM kpi_events
                 WHERE event_date BETWEEN ? AND ?
                 GROUP BY event_date, staff_code
@@ -367,6 +391,192 @@ class KPIStore:
                 (date_from, date_to),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Write: uspeshka  (Успешно реализовано)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def record_uspeshka(
+        self,
+        lead_id: str,
+        event_date: str | None = None,
+        budget: float = 0.0,
+        pipeline_name: str = "",
+    ) -> bool:
+        """Record an 'Успешно реализовано' event.
+
+        Idempotent per lead: only the first Успешно is counted.
+        Staff is resolved via lead_consul_log (same as zakas/dumka).
+        """
+        if not lead_id:
+            return False
+        event_date = event_date or self._today_str()
+        with self._lock:
+            with self._connect() as conn:
+                consul_row = conn.execute(
+                    "SELECT staff_code, pipeline_name FROM lead_consul_log WHERE lead_id = ?",
+                    (str(lead_id),),
+                ).fetchone()
+                if not consul_row:
+                    return False
+                staff_code   = consul_row["staff_code"]
+                pipeline_use = pipeline_name or consul_row["pipeline_name"]
+                existing = conn.execute(
+                    "SELECT id FROM kpi_events WHERE lead_id = ? AND event_type = 'uspeshka' LIMIT 1",
+                    (str(lead_id),),
+                ).fetchone()
+                if existing:
+                    return False
+                now = self._now_str()
+                conn.execute(
+                    "INSERT INTO kpi_events "
+                    "(lead_id, staff_code, event_type, event_date, pipeline_name, budget, created_at) "
+                    "VALUES (?, ?, 'uspeshka', ?, ?, ?, ?)",
+                    (str(lead_id), staff_code, event_date, pipeline_use, budget, now),
+                )
+                return True
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Write: otkaz  (Закрыто и не реализовано)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def record_otkaz(
+        self,
+        lead_id: str,
+        event_date: str | None = None,
+        pipeline_name: str = "",
+    ) -> bool:
+        """Record a final rejection event.
+
+        Idempotent per lead (one otkaz per lead — last status wins).
+        Staff is resolved via lead_consul_log.
+        """
+        if not lead_id:
+            return False
+        event_date = event_date or self._today_str()
+        with self._lock:
+            with self._connect() as conn:
+                consul_row = conn.execute(
+                    "SELECT staff_code, pipeline_name FROM lead_consul_log WHERE lead_id = ?",
+                    (str(lead_id),),
+                ).fetchone()
+                if not consul_row:
+                    return False
+                staff_code   = consul_row["staff_code"]
+                pipeline_use = pipeline_name or consul_row["pipeline_name"]
+                existing = conn.execute(
+                    "SELECT id FROM kpi_events WHERE lead_id = ? AND event_type = 'otkaz' LIMIT 1",
+                    (str(lead_id),),
+                ).fetchone()
+                if existing:
+                    return False
+                now = self._now_str()
+                conn.execute(
+                    "INSERT INTO kpi_events "
+                    "(lead_id, staff_code, event_type, event_date, pipeline_name, budget, created_at) "
+                    "VALUES (?, ?, 'otkaz', ?, ?, 0, ?)",
+                    (str(lead_id), staff_code, event_date, pipeline_use, now),
+                )
+                return True
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Manager snapshots
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def create_manager_snapshot(self, snapshot_date: str) -> Dict[str, Any]:
+        """Aggregate kpi_events for snapshot_date and upsert into manager_snapshots.
+
+        This is called by the nightly scheduled fetch after the catch-up backfill
+        completes, freezing the day's data.  Calling it again on the same date
+        overwrites the previous snapshot (idempotent).
+        Returns a summary dict with per-column totals.
+        """
+        rows = self.get_staff_stats(snapshot_date, snapshot_date)
+        if not rows:
+            return {"snapshot_date": snapshot_date, "staff_count": 0}
+        with self._lock:
+            with self._connect() as conn:
+                for r in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO manager_snapshots
+                            (snapshot_date, staff_code, consul, zakas, dumka, summa,
+                             uspeshka, uspeshka_summa, otkaz)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(snapshot_date, staff_code) DO UPDATE SET
+                            consul         = excluded.consul,
+                            zakas          = excluded.zakas,
+                            dumka          = excluded.dumka,
+                            summa          = excluded.summa,
+                            uspeshka       = excluded.uspeshka,
+                            uspeshka_summa = excluded.uspeshka_summa,
+                            otkaz          = excluded.otkaz
+                        """,
+                        (
+                            snapshot_date,
+                            r["staff_code"],
+                            int(r.get("consul", 0)),
+                            int(r.get("zakas", 0)),
+                            int(r.get("dumka", 0)),
+                            float(r.get("summa", 0)),
+                            int(r.get("uspeshka", 0)),
+                            float(r.get("uspeshka_summa", 0)),
+                            int(r.get("otkaz", 0)),
+                        ),
+                    )
+        total_staff = len({r["staff_code"] for r in rows})
+        return {
+            "snapshot_date": snapshot_date,
+            "staff_count":   total_staff,
+            "total_consul":  sum(int(r.get("consul", 0)) for r in rows),
+            "total_zakas":   sum(int(r.get("zakas", 0)) for r in rows),
+            "total_uspeshka": sum(int(r.get("uspeshka", 0)) for r in rows),
+            "total_otkaz":   sum(int(r.get("otkaz", 0)) for r in rows),
+        }
+
+    def get_manager_stats_snapshot(
+        self, date_from: str, date_to: str
+    ) -> List[Dict[str, Any]]:
+        """Return per-staff KPI aggregated across frozen manager_snapshots in [date_from, date_to].
+
+        Used by the dashboard for past days (zero AMO API calls needed).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    staff_code,
+                    SUM(consul)         AS consul,
+                    SUM(zakas)          AS zakas,
+                    SUM(dumka)          AS dumka,
+                    SUM(summa)          AS summa,
+                    SUM(uspeshka)       AS uspeshka,
+                    SUM(uspeshka_summa) AS uspeshka_summa,
+                    SUM(otkaz)          AS otkaz
+                FROM manager_snapshots
+                WHERE snapshot_date BETWEEN ? AND ?
+                GROUP BY staff_code
+                """,
+                (date_from, date_to),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_available_snapshot_dates(self) -> List[str]:
+        """Return all dates that have a frozen snapshot, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT snapshot_date FROM manager_snapshots ORDER BY snapshot_date DESC"
+            ).fetchall()
+        return [r["snapshot_date"] for r in rows]
+
+    def has_snapshot(self, snapshot_date: str) -> bool:
+        """Return True if a snapshot already exists for this date."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM manager_snapshots WHERE snapshot_date = ? LIMIT 1",
+                (snapshot_date,),
+            ).fetchone()
+        return row is not None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Backfill tracking
@@ -415,6 +625,8 @@ class KPIStore:
         zakas_status_ids: set,
         dumka_status_ids: set,
         sotuv_pipeline_ids: set,
+        uspeshka_status_ids: set | None = None,
+        otkaz_status_ids: set | None = None,
     ) -> Dict[str, int]:
         """Replay AMO events and populate the KPI store.
 
@@ -489,12 +701,16 @@ class KPIStore:
                 lead_events[lead_id].append(("zakas", ev_date, ev_ts))
             elif new_sid in dumka_status_ids:
                 lead_events[lead_id].append(("dumka", ev_date, ev_ts))
+            elif uspeshka_status_ids and new_sid in uspeshka_status_ids:
+                lead_events[lead_id].append(("uspeshka", ev_date, ev_ts))
+            elif otkaz_status_ids and new_sid in otkaz_status_ids:
+                lead_events[lead_id].append(("otkaz", ev_date, ev_ts))
 
         unique_lead_ids = list(lead_events.keys())
         print(f"[KPI-BACKFILL] {len(unique_lead_ids)} unique leads with KPI events.")
 
         if not unique_lead_ids:
-            return {"consul": 0, "zakas": 0, "dumka": 0, "skipped": 0, "errors": 0}
+            return {"consul": 0, "zakas": 0, "dumka": 0, "uspeshka": 0, "otkaz": 0, "skipped": 0, "errors": 0}
 
         # ── Step 3: batch-fetch leads (Код сотрудника) ────────────────────────
         lead_details: Dict[int, Dict] = {}
@@ -512,7 +728,8 @@ class KPIStore:
 
         # ── Step 4: record events ──────────────────────────────────────────────
         counts: Dict[str, int] = {
-            "consul": 0, "zakas": 0, "dumka": 0, "skipped": 0, "errors": 0
+            "consul": 0, "zakas": 0, "dumka": 0,
+            "uspeshka": 0, "otkaz": 0, "skipped": 0, "errors": 0
         }
 
         for lead_id, events in lead_events.items():
@@ -573,6 +790,20 @@ class KPIStore:
                         ok = self.record_dumka(str(lead_id), ev_date, pipeline_name)
                         if ok:
                             counts["dumka"] += 1
+
+                    elif event_type == "uspeshka":
+                        if not self.has_consul(str(lead_id)):
+                            self.record_consul(str(lead_id), staff_code, ev_date, pipeline_name, budget)
+                        ok = self.record_uspeshka(str(lead_id), ev_date, budget, pipeline_name)
+                        if ok:
+                            counts["uspeshka"] += 1
+
+                    elif event_type == "otkaz":
+                        if not self.has_consul(str(lead_id)):
+                            self.record_consul(str(lead_id), staff_code, ev_date, pipeline_name, budget)
+                        ok = self.record_otkaz(str(lead_id), ev_date, pipeline_name)
+                        if ok:
+                            counts["otkaz"] += 1
 
                 except Exception as exc:
                     print(f"[KPI-BACKFILL] Error on lead {lead_id} / {event_type}: {exc}")

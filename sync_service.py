@@ -209,6 +209,10 @@ KPI_CONSUL_DISPLAY_NAMES: set[str] = {"Консультация"}
 KPI_ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ"}
 # Dumka: the lead is in a "thinking / hesitating" state.
 KPI_DUMKA_DISPLAY_NAMES: set[str] = {"Раздумье"}
+# Uspeshka: lead was successfully realised (Успешно реализовано).
+KPI_USPESHKA_DISPLAY_NAMES: set[str] = {"Успешно реализовано"}
+# Otkaz: lead was closed without a sale.
+KPI_OTKAZ_FINAL_DISPLAY_NAMES: set[str] = {"Закрыто и не реализовано"}
 
 
 def _extract_staff_code(lead: Dict[str, Any]) -> str:
@@ -1869,6 +1873,16 @@ class SyncService:
                 if ok:
                     _log.info("KPI dumka   lead=%s", lead_id)
 
+            elif display_name in KPI_USPESHKA_DISPLAY_NAMES:
+                ok = self.kpi_store.record_uspeshka(lead_id, None, budget, pipeline_name)
+                if ok:
+                    _log.info("KPI uspeshka lead=%s budget=%s", lead_id, budget)
+
+            elif display_name in KPI_OTKAZ_FINAL_DISPLAY_NAMES:
+                ok = self.kpi_store.record_otkaz(lead_id, None, pipeline_name)
+                if ok:
+                    _log.info("KPI otkaz   lead=%s", lead_id)
+
         except Exception as exc:
             _log.error("KPI error recording event for lead %s: %s", lead_id, exc)
 
@@ -1898,6 +1912,18 @@ class SyncService:
             for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
             if dname in KPI_DUMKA_DISPLAY_NAMES
         }
+        uspeshka_status_ids: set[int] = {
+            sid
+            for pid in scope
+            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
+            if dname in KPI_USPESHKA_DISPLAY_NAMES
+        }
+        otkaz_status_ids: set[int] = {
+            sid
+            for pid in scope
+            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
+            if dname in KPI_OTKAZ_FINAL_DISPLAY_NAMES
+        }
 
         return self.kpi_store.backfill_from_amo(
             amo=self.amo,
@@ -1907,7 +1933,30 @@ class SyncService:
             zakas_status_ids=zakas_status_ids,
             dumka_status_ids=dumka_status_ids,
             sotuv_pipeline_ids=sotuv_pipeline_ids,
+            uspeshka_status_ids=uspeshka_status_ids,
+            otkaz_status_ids=otkaz_status_ids,
         )
+
+    def run_daily_catchup(self, date_str: str) -> Dict[str, int]:
+        """Re-fetch AMO events for one day and update kpi_events (no snapshot)."""
+        _log.info("[KPI-CATCHUP] Running for %s", date_str)
+        try:
+            counts = self.run_kpi_backfill(date_str, date_str)
+            _log.info("[KPI-CATCHUP] Done for %s: %s", date_str, counts)
+            return counts
+        except Exception as exc:
+            _log.error("[KPI-CATCHUP] Failed for %s: %s", date_str, exc)
+            return {}
+
+    def run_nightly_snapshot(self, date_str: str) -> None:
+        """Re-fetch AMO events then freeze the day into manager_snapshots."""
+        _log.info("[KPI-SNAPSHOT] Starting nightly snapshot for %s", date_str)
+        try:
+            self.run_daily_catchup(date_str)
+            self.kpi_store.create_manager_snapshot(date_str)
+            _log.info("[KPI-SNAPSHOT] Snapshot created for %s", date_str)
+        except Exception as exc:
+            _log.error("[KPI-SNAPSHOT] Failed for %s: %s", date_str, exc)
 
     def process_webhook_leads(self, leads: List[Dict[str, Any]]) -> Dict[str, Any]:
         written = 0
@@ -2351,6 +2400,15 @@ class DashboardContext:
         self.pipeline_id_to_name     = svc.pipeline_id_to_name
         self.status_id_to_display_name = svc.status_id_to_display_name
         self._sheet                  = svc.sheet  # private, never exposed directly
+        self._svc                    = svc  # for scheduler-triggered operations
+
+    def run_nightly_snapshot(self, date_str: str) -> None:
+        """Trigger a KPI re-fetch + snapshot freeze for the given date."""
+        self._svc.run_nightly_snapshot(date_str)
+
+    def run_daily_catchup(self, date_str: str) -> Dict[str, int]:
+        """Trigger a KPI re-fetch (no snapshot) for the given date."""
+        return self._svc.run_daily_catchup(date_str)
 
     def get_staff_list(self) -> Dict[str, Dict]:
         """Return {code → {code, group, full_name}} read from the Staff worksheet.
@@ -2492,6 +2550,62 @@ def on_startup() -> None:
             except Exception as _exc:
                 _log.error("KPI backfill failed: %s", _exc)
         threading.Thread(target=_run_backfill, daemon=True).start()
+
+    # ── Twice-daily KPI scheduler ────────────────────────────────────────────
+    # 13:00–14:00: midday live catch-up  (no snapshot, just refreshes kpi_events)
+    # 23:00–00:00: nightly snapshot       (catch-up + freeze into manager_snapshots)
+    _state_file = os.path.join(os.path.dirname(__file__), ".sync_state.json")
+
+    def _load_sched_state() -> dict:
+        try:
+            with open(_state_file) as _f:
+                return json.load(_f)
+        except Exception:
+            return {}
+
+    def _save_sched_state(state: dict) -> None:
+        try:
+            with open(_state_file, "w") as _f:
+                json.dump(state, _f)
+        except Exception as _exc:
+            _log.warning("Could not save sched state: %s", _exc)
+
+    def _kpi_scheduler() -> None:
+        import datetime as _dt
+        tz_offset = getattr(service.cfg, "DISPLAY_TZ_OFFSET", 5)
+        tz = _dt.timezone(_dt.timedelta(hours=tz_offset))
+        state = _load_sched_state()
+        while True:
+            try:
+                now = _dt.datetime.now(tz)
+                today_str = now.strftime("%Y-%m-%d")
+                hour = now.hour
+
+                if 13 <= hour < 14 and state.get("kpi_midday_done") != today_str:
+                    state["kpi_midday_done"] = today_str
+                    _save_sched_state(state)
+                    threading.Thread(
+                        target=service.run_daily_catchup,
+                        args=(today_str,),
+                        daemon=True,
+                        name="kpi-midday",
+                    ).start()
+
+                if 23 <= hour < 24 and state.get("kpi_nightly_done") != today_str:
+                    state["kpi_nightly_done"] = today_str
+                    _save_sched_state(state)
+                    threading.Thread(
+                        target=service.run_nightly_snapshot,
+                        args=(today_str,),
+                        daemon=True,
+                        name="kpi-nightly",
+                    ).start()
+
+            except Exception as _exc:
+                _log.error("KPI scheduler error: %s", _exc)
+            time.sleep(60)
+
+    threading.Thread(target=_kpi_scheduler, daemon=True, name="kpi-scheduler").start()
 
 
 @app.get("/health")
