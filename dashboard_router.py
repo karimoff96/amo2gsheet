@@ -576,8 +576,8 @@ def create_dashboard_router(service) -> APIRouter:
             ws2 = wb.create_sheet("Сотрудники")
             ws2.sheet_view.showGridLines = False
             STAFF_COLS = ["#", "Отдел", "Код", "Сотрудник",
-                          "Olag (Consul)", "Zakaz Soni", "Zakaz Konv.%",
-                          "Qilingan Summa", "Uspeshka Summas", "Uspeshka Konv.%"]
+                          "Консультации", "Заказы", "Конв. заказа",
+                          "Сумма заказов", "Успеш. сумма", "Конв. успеха"]
             row_num = 1
             hdr(ws2, row_num, STAFF_COLS)
             row_num += 1
@@ -831,10 +831,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     input[type="date"]:focus, input[type="text"]:focus { outline:none; border-color:#3b82f6; }
 
     /* ── Grid ── */
-    #gc { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; align-items:start; }
+    #gc { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; align-items:start; }
     #gc.g1 { grid-template-columns:1fr; }
     #gc.g2 { grid-template-columns:repeat(2,1fr); }
-    #gc.g3 { grid-template-columns:repeat(3,1fr); }
+    #gc.g3 { grid-template-columns:repeat(2,1fr); }
     .gc-card.hidden-gc { display:none; }
 
     .tbl-scroll { max-height:480px; overflow-y:auto; }
@@ -952,17 +952,17 @@ let autoTimer = null;
 let sortState = {};   // tableId → {col, dir}
 
 // ── Column definitions ─────────────────────────────────────────────────────────
-// Columns: # | Код | Сотрудник | Olag | Zakaz Soni | Zakaz Konv.% | Qilingan Summa | Uspeshka Summas | Uspeshka Konv.%
+// Columns: # | Код | Сотрудник | Консульт. | Заказы | Конв. заказа | Сумма | Успеш. сумма | Конв. успеха
 const COLS = [
   { key:'num',           label:'#',              align:'left',  fmt: v => v },
   { key:'code',          label:'Код',            align:'right', fmt: v => `<span class="text-slate-500 text-[10px]">${v}</span>` },
   { key:'name',          label:'Сотрудник',      align:'left',  fmt: v => `<span class="text-slate-200 font-medium">${v}</span>` },
-  { key:'consul',        label:'Olag',           align:'right', fmt: v => `<span class="text-blue-300 font-semibold">${v}</span>` },
-  { key:'zakas',         label:'Zakaz Soni',     align:'right', fmt: v => `<span class="text-green-400 font-semibold">${v}</span>` },
-  { key:'zakaz_conv',    label:'Zakaz Konv.%',   align:'right', fmt: v => convBar(v) },
-  { key:'summa',         label:'Qilingan Summa', align:'right', fmt: v => `<span class="text-yellow-400 font-semibold">${fmtMoney(v)}</span>` },
-  { key:'uspeshka_summa',label:'Uspeshka Summas',align:'right', fmt: v => `<span class="text-emerald-400 font-semibold">${fmtMoney(v)}</span>` },
-  { key:'uspeshka_conv', label:'Uspeshka Konv.%',align:'right', fmt: v => convBar(v) },
+  { key:'consul',        label:'Консульт.',      align:'right', fmt: v => `<span class="text-blue-300 font-semibold">${v}</span>` },
+  { key:'zakas',         label:'Заказы',         align:'right', fmt: v => `<span class="text-green-400 font-semibold">${v}</span>` },
+  { key:'zakaz_conv',    label:'Конв. заказа',   align:'right', fmt: v => convBar(v) },
+  { key:'summa',         label:'Сумма',          align:'right', fmt: v => `<span class="text-yellow-400 font-semibold">${fmtMoney(v)}</span>` },
+  { key:'uspeshka_summa',label:'Успеш. сумма',   align:'right', fmt: v => `<span class="text-emerald-400 font-semibold">${fmtMoney(v)}</span>` },
+  { key:'uspeshka_conv', label:'Конв. успеха',   align:'right', fmt: v => convBar(v) },
 ];
 
 // ── Init ─────────────────────────────────────────────────────────────────────
@@ -1012,10 +1012,9 @@ function applyGrpVis() {
     if (show) vis++;
   });
   const gc = document.getElementById('gc');
-  gc.classList.remove('g1','g2','g3');
+  gc.classList.remove('g1','g2');
   if (vis===1) gc.classList.add('g1');
   else if (vis===2) gc.classList.add('g2');
-  else if (vis===3) gc.classList.add('g3');
   filterStaff();
 }
 
@@ -1069,12 +1068,12 @@ function renderBadge(data) {
 
 // ── Summary cards ─────────────────────────────────────────────────────────────
 const SCARDS = [
-  { lbl:'Olag (Consul)',      color:'#1e3a5f', ic:'💬', icBg:'#1d4ed820', icCol:'#60a5fa',  key:'total_consul' },
-  { lbl:'Zakaz Soni',        color:'#14532d', ic:'✅', icBg:'#15803d20', icCol:'#4ade80',  key:'total_zakas' },
-  { lbl:'Zakaz Konv.%',      color:'#2e1065', ic:'%',  icBg:'#5b21b620', icCol:'#c4b5fd',  key:'avg_zakaz_conv', sfx:'%' },
-  { lbl:'Qilingan Summa',    color:'#422006', ic:'₸',  icBg:'#92400e20', icCol:'#fbbf24',  key:'total_summa' },
-  { lbl:'Uspeshka Summas',   color:'#064e3b', ic:'🏆', icBg:'#06532520', icCol:'#34d399',  key:'total_uspeshka_summa' },
-  { lbl:'Uspeshka Konv.%',   color:'#134e4a', ic:'📈', icBg:'#0f766e20', icCol:'#2dd4bf',  key:'avg_uspeshka_conv', sfx:'%' },
+  { lbl:'Консультации',      color:'#1e3a5f', ic:'💬', icBg:'#1d4ed820', icCol:'#60a5fa',  key:'total_consul' },
+  { lbl:'Заказы',            color:'#14532d', ic:'✅', icBg:'#15803d20', icCol:'#4ade80',  key:'total_zakas' },
+  { lbl:'Конв. заказа',      color:'#2e1065', ic:'%',  icBg:'#5b21b620', icCol:'#c4b5fd',  key:'avg_zakaz_conv', sfx:'%' },
+  { lbl:'Сумма заказов',     color:'#422006', ic:'₸',  icBg:'#92400e20', icCol:'#fbbf24',  key:'total_summa' },
+  { lbl:'Успешная сумма',    color:'#064e3b', ic:'🏆', icBg:'#06532520', icCol:'#34d399',  key:'total_uspeshka_summa' },
+  { lbl:'Конв. успеха',      color:'#134e4a', ic:'📈', icBg:'#0f766e20', icCol:'#2dd4bf',  key:'avg_uspeshka_conv', sfx:'%' },
 ];
 
 function renderSummary(data) {
