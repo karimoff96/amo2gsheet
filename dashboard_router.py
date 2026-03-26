@@ -553,12 +553,12 @@ def create_dashboard_router(service) -> APIRouter:
             summary_rows = [
                 ("Период",          f"{date_from}  –  {date_to}"),
                 ("Группа фильтр",  group or "Все"),
-                ("Консультации",     stats["total_consul"]),
-                ("Заказы",           stats["total_zakas"]),
-                ("Отказы",           stats["total_otkaz"]),
-                ("Раздумья",        stats["total_dumka"]),
-                ("Сумма заказов",  stats["total_summa"]),
-                ("Конверсия",       f"{stats['avg_conversion']}%"),
+                ("Консультации",     stats.get("total_consul", 0)),
+                ("Заказы",           stats.get("total_zakas", 0)),
+                ("Отказы",           stats.get("total_otkaz", "—")),
+                ("Раздумья",        stats.get("total_dumka", "—")),
+                ("Сумма заказов",  stats.get("total_summa", 0)),
+                ("Конв. заказа",    f"{stats.get('avg_zakaz_conv', stats.get('avg_conversion', 0))}%"),
             ]
             for r, (label, val) in enumerate(summary_rows, 1):
                 lc = ws1.cell(row=r, column=1, value=label)
@@ -622,7 +622,8 @@ def create_dashboard_router(service) -> APIRouter:
             )
         except Exception as exc:
             print(f"[DASHBOARD] Export error: {traceback.format_exc()}")
-            return {"error": str(exc)}
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=500, content={"error": str(exc)})
 
     return router
 
