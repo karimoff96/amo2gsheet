@@ -1722,8 +1722,18 @@ class SyncService:
             except ValueError:
                 pass  # already "MM.YYYY" or some other format
 
-        # Fast path: still in the same month
+        # Fast path: still in the same month — but guarantee the active tab exists.
+        # If a previous run died mid-rotation (after renaming Sheet1 to the archive
+        # tab but before creating the new Sheet1), the saved month already matches
+        # the current month so we'd normally skip everything.  The _sheets cache
+        # ensures _get_or_create_month_sheet only hits the Sheets API on the first
+        # call after startup; subsequent calls in the same process are O(1).
         if known_key == current_month:
+            try:
+                self.sheet._get_or_create_month_sheet(self.cfg.GOOGLE_WORKSHEET_NAME)
+            except Exception as exc:
+                _log.warning("Could not ensure active tab '%s': %s",
+                             self.cfg.GOOGLE_WORKSHEET_NAME, exc)
             return
 
         main_name = self.cfg.GOOGLE_WORKSHEET_NAME
