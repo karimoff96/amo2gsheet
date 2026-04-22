@@ -9,10 +9,10 @@ google-auth==2.48.0
 google-auth-oauthlib==1.2.4
 gspread==6.2.1
 idna==3.11
-numpy==2.4.2
+numpy
 oauthlib==3.3.1
 openpyxl==3.1.5
-pandas==3.0.1
+pandas
 pyasn1==0.6.2
 pyasn1_modules==0.4.2
 pycparser==3.0

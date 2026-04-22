@@ -1625,7 +1625,7 @@ class SyncService:
             page = 1
             while True:
                 data = self.amo.get(
-                    f"/api/v4/leads?{ids_param}&limit=250&page={page}"
+                    f"/api/v4/leads?{ids_param}&with=contacts,companies&limit=250&page={page}"
                 )
                 batch = (data.get("_embedded") or {}).get("leads") or []
                 if not batch:

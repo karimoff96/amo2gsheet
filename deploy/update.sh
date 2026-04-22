@@ -6,7 +6,7 @@
 # ============================================================
 set -euo pipefail
 
-PROJECT_DIR="/home/amo2gsheet"
+PROJECT_DIR="/home/Projects/amo2gsheet"
 VENV="$PROJECT_DIR/venv"
 
 echo "==> Pulling latest code..."
