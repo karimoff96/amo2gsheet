@@ -181,8 +181,8 @@ ORDER_NUM_FILLED_AMO_STATUS_DISPLAY = "У курера"
 # See SYNC_LOGIC.md for the full rules. Key rules:
 #   "У курера"  (sheet) → "Успешно" lookup → resolves to AMO "Успешно реализовано" (won status).
 #   "Успешно"   (sheet) → NOT pushed to AMO at all — it is display-only for staff.
-#   "Отказ"     (sheet) → AMO reject step.
-#   "В процессе"(sheet) → AMO В процессе (rarely patched manually).
+#   "Отказ"     (sheet) → AMO pipeline step "ОТКАЗ".
+#   "В процессе"(sheet) → AMO ЗАКАЗ БЕЗ НУМЕРАЦИИ (no order#) or ЗАКАЗ ОТПРАВЛЕН (has order#).
 SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
     "В процессе": "В процессе",
     # When admin sets "У курера" in the sheet the lead is considered delivered —
@@ -191,14 +191,20 @@ SHEET_STATUS_TO_AMO_DISPLAY: Dict[str, str] = {
     "У курера":   "Успешно",
     # "Успешно" is intentionally absent — it must never be pushed to AMO.
     # It is a display-only label that staff use to mark their own record keeping.
+    # "Отказ" uses the display name (not the raw AMO name "ОТКАЗ"/"OTKAZ") because
+    # pipeline_status_display_to_id is keyed by display names.  This resolves
+    # correctly for all pipelines regardless of how the step is spelled in AMO.
     "Отказ":      "Отказ",
 }
 
 # Maps an AMO display status name → the status that should be written to the Google Sheet
 # when a tracked lead receives that AMO status via webhook.
 # e.g. when a manager manually sets "Раздумье" in AMO, the sheet row is updated to "Отказ".
+# "У курера" maps back to "В процессе": when AMO sends a ЗАКАЗ ОТПРАВЛЕН webhook, the
+# sheet row must stay at "В процессе" (the order number was entered, not yet delivered).
 AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
     "Раздумье": "Отказ",
+    "У курера":  "В процессе",
 }
 
 # ── KPI status groupings (used by KPI store event recording) ─────────────────
@@ -298,6 +304,8 @@ class Config:
     # Leads created before this timestamp are silently ignored (0 = process all).
     # Supports human-readable 'DD.MM.YYYY HH:MM:SS' (UTC) or plain Unix timestamp.
     LEADS_CREATED_AFTER = _parse_leads_created_after(os.getenv("LEADS_CREATED_AFTER", "0"))
+    # Set BOOTSTRAP_RECOVERY=false to skip pushing missed Заказ № values on startup.
+    BOOTSTRAP_RECOVERY = os.getenv("BOOTSTRAP_RECOVERY", "true").strip().lower() not in ("false", "0", "no")
     # Only process leads from pipelines whose name contains this keyword (case-insensitive).
     # New pipelines matching the keyword are picked up automatically. Empty = all pipelines.
     PIPELINE_KEYWORD = os.getenv("PIPELINE_KEYWORD", "").strip().lower()
@@ -1475,11 +1483,31 @@ class SyncService:
     )
 
     def bootstrap_sheet_state(self) -> None:
-        rows = self.sheet.iter_lead_statuses()
+        # ── Detect leads whose order-number was never re-registered after a row
+        # deletion + re-add cycle.  The failure signature is: the lead exists in
+        # sheet_status_by_lead (status was re-synced by sync_sheet_to_amo after the
+        # row reappeared) but is absent from sheet_order_number_by_lead (the order#
+        # path was never restored).  When bootstrap then reads the sheet and finds a
+        # non-empty Заказ № for such a lead, the normal trigger will not fire because
+        # the recorded known_order is now the filled value, not "".  We queue these
+        # leads here and push the missed PATCH to AMO after the main bootstrap loop.
+        # Include leads where known_order is absent OR empty ("") —
+        # both mean the order-number PATCH has never been sent to AMO.
+        _status_no_order: set = {
+            lid for lid in self.state.get("sheet_status_by_lead", {})
+            if not self.state.get("sheet_order_number_by_lead", {}).get(lid, "")
+        }
+
+        # Bootstrap only from Sheet1 — the active tab. Old month archive tabs are
+        # never re-scanned to avoid the historical replay storm.
+        rows = self.sheet.iter_lead_statuses(tabs_filter={self.cfg.GOOGLE_WORKSHEET_NAME})
+        _missed_pushes: List[Dict[str, Any]] = []
+
         for item in rows:
             raw_status = item["status"]
             lead_id    = item["lead_id"]
             tab        = item.get("tab_name", "")
+            order_number = item.get("order_number", "")
 
             # ── Heal stale / raw status names written before normalization was in place ──
             # If the cell contains a raw AMO status name (e.g. "заказ отпрAвлен" with
@@ -1504,13 +1532,93 @@ class SyncService:
                         _log.warning("BOOTSTRAP heal failed for lead %s: %s", lead_id, exc)
                     healed_status = candidate
 
+            # ── Queue leads whose Заказ № PATCH was never sent to AMO ──
+            if (lead_id in _status_no_order
+                    and order_number
+                    and healed_status == "В процессе"):
+                _missed_pushes.append({"lead_id": lead_id, "order_number": order_number})
+
             self.remember_sheet_status(lead_id, healed_status)
             # Snapshot the current order number so we can detect when it gets filled
-            self.remember_sheet_order_number(lead_id, item.get("order_number", ""))
+            self.remember_sheet_order_number(lead_id, order_number)
             # Record which tab each lead lives on (used by update_status routing)
             if tab:
                 self.remember_lead_tab(lead_id, tab)
         self.flush_state()  # Persist bootstrapped state in one write
+
+        # ── Recovery: push missed Заказ № values to AMO ──
+        # Only act if AMO's order# field is still empty — guards against double-push
+        # on repeated restarts or when the field was already corrected manually.
+        if not self.cfg.BOOTSTRAP_RECOVERY:
+            _log.info("BOOTSTRAP RECOVERY skipped (BOOTSTRAP_RECOVERY=false)")
+            _missed_pushes.clear()
+        if not _missed_pushes:
+            return
+
+        # Run recovery in a background thread so the worker loop starts immediately
+        # and can handle new leads while the replay processes historic rows.
+        def _do_recovery(missed_list: list) -> None:
+            _log.info("BOOTSTRAP RECOVERY starting: %d lead(s) to replay in background", len(missed_list))
+            for _i, missed in enumerate(missed_list):
+                _lid = missed["lead_id"]
+                _order = missed["order_number"]
+                try:
+                    _lead_data = self.amo.get(f"/api/v4/leads/{_lid}")
+                    if not _lead_data:
+                        continue
+                    _pipeline_id = int(_lead_data.get("pipeline_id", 0) or 0)
+                    # Read the current AMO value of the Заказ № field.
+                    _amo_order = ""
+                    for _cf in (_lead_data.get("custom_fields_values") or []):
+                        if _cf.get("field_id") == 987889:
+                            _amo_order = str((((_cf.get("values") or [{}])[0]).get("value", "")) or "")
+                            break
+                    if _amo_order:
+                        # AMO already has the value (manually corrected or from a prior run).
+                        _log_lead.info(
+                            "BOOTSTRAP RECOVERY: lead=%s order# already in AMO ('%s') — skipping",
+                            _lid, _amo_order,
+                        )
+                        continue
+                    _status_id = (
+                        self.pipeline_status_display_to_id.get(_pipeline_id, {}).get(ORDER_NUM_FILLED_AMO_STATUS_DISPLAY)
+                        or self.pipeline_status_name_to_id.get(_pipeline_id, {}).get("Заказ отправлен")
+                    )
+                    if not _status_id:
+                        _log_lead.warning(
+                            "BOOTSTRAP RECOVERY: lead=%s no '%s' status found for pipeline %d — skipping",
+                            _lid, ORDER_NUM_FILLED_AMO_STATUS_DISPLAY, _pipeline_id,
+                        )
+                        continue
+                    self.amo.patch(
+                        f"/api/v4/leads/{_lid}",
+                        {
+                            "status_id": _status_id,
+                            "pipeline_id": _pipeline_id or self.cfg.PIPELINE_ID,
+                            "custom_fields_values": [
+                                {"field_id": 987889, "values": [{"value": _order}]}
+                            ],
+                        },
+                    )
+                    _log_lead.info(
+                        "BOOTSTRAP RECOVERY: lead=%s order# '%s' → AMO PATCH sent "
+                        "(status_id=%d pipeline=%d)",
+                        _lid, _order, _status_id, _pipeline_id,
+                    )
+                    # Sheet status stays at "В процессе" — the order number was entered
+                    # but the parcel is not yet delivered.  The sheet must not be
+                    # updated to "У курера" here; that transition only happens when the
+                    # operator explicitly sets "У курера" in the sheet.
+                    self.remember_sheet_status(_lid, "В процессе")
+                except Exception as exc:
+                    _log.error("BOOTSTRAP RECOVERY: lead=%s failed: %s", _lid, exc)
+                # Flush state every 20 leads to guard against crash mid-recovery.
+                if (_i + 1) % 20 == 0:
+                    self.flush_state()
+            self.flush_state()
+            _log.info("BOOTSTRAP RECOVERY complete: %d lead(s) processed", len(missed_list))
+
+        threading.Thread(target=_do_recovery, args=(_missed_pushes,), daemon=True, name="bootstrap-recovery").start()
 
     def initial_sync_leads(self, date_from: str, date_to: str) -> None:
         """Fetch all AMO leads created in [date_from, date_to] and upsert them into the sheet.
@@ -2067,14 +2175,20 @@ class SyncService:
                     )
                     continue
 
-            if status_id in self.trigger_status_ids:
+            # Also treat as trigger if the webhook itself said trigger AND this lead isn't
+            # yet tracked — handles the race where the live status already moved on by the
+            # time the batch fetch ran (e.g. after a server restart with a backlog of retries).
+            webhook_is_trigger = webhook_status_id in self.trigger_status_ids
+            if status_id in self.trigger_status_ids or (webhook_is_trigger and not known_status):
                 trigger_matches  += 1
                 trigger_display   = STATUS_DISPLAY_MAP.get(self.cfg.TRIGGER_STATUS_NAME, self.cfg.TRIGGER_STATUS_NAME)
                 pipeline_id       = int(full_lead.get("pipeline_id", 0) or 0)
                 pipeline_name     = self.pipeline_id_to_name.get(pipeline_id, "")
                 responsible_id    = int(full_lead.get("responsible_user_id", 0) or 0)
                 responsible_name  = self.users_map.get(responsible_id, str(responsible_id))
-                current_status_name = self.status_id_to_display_name.get(status_id, trigger_display)
+                # When the live status has already moved on, use the webhook status for display.
+                effective_status_id = status_id if status_id in self.trigger_status_ids else webhook_status_id
+                current_status_name = self.status_id_to_display_name.get(effective_status_id, trigger_display)
 
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
@@ -2099,15 +2213,6 @@ class SyncService:
                 terminal_matches += 1
                 lead_pipeline_id  = int(full_lead.get("pipeline_id", 0) or 0)
                 sheet_display     = AMO_STATUS_TO_SHEET_OVERRIDE.get(terminal_name, terminal_name)
-                # When admin filled Заказ № → AMO moved to Заказ отправлен → webhook comes back as
-                # "У курера".  Sheet must stay "В процессе" until operator changes it manually.
-                if sheet_display == "У курера" and known_status == "В процессе":
-                    skipped_status_mismatch += 1
-                    _log_wh.debug(
-                        "WEBHOOK TERMINAL lead=%s status='%s' — suppressed (У курера while В процессе)",
-                        lead_id, terminal_name,
-                    )
-                    continue
                 # "Успешно" is display-only for staff and must NEVER be written to the
                 # sheet by an incoming webhook.  The sheet already reflects what the
                 # operator chose ("У курера", "В процессе", etc.) and that must be
@@ -2132,10 +2237,6 @@ class SyncService:
                 if known_status:
                     new_status_display = self.status_id_to_display_name.get(status_id, str(status_id))
                     sheet_display      = AMO_STATUS_TO_SHEET_OVERRIDE.get(new_status_display, new_status_display)
-                    # Same suppression: Заказ отправлен webhook must not overwrite "В процессе"
-                    if sheet_display == "У курера" and known_status == "В процессе":
-                        skipped_status_mismatch += 1
-                        continue
                     # "Успешно" is display-only — never write it to the sheet from a webhook.
                     if sheet_display == "Успешно":
                         skipped_status_mismatch += 1
@@ -2203,18 +2304,10 @@ class SyncService:
         self.flush_state()
 
     def sync_sheet_to_amo(self) -> None:
-        # Only scan the current-month tab plus any archived tab that still hosts
-        # a live (non-terminal) lead.  This avoids reading old monthly tabs that
-        # contain only finalised leads and will never produce a status change.
-        _terminal_statuses = {"Успешно", "Отказ", "Закрыто и не реализовано"}
-        _tz = timezone(timedelta(hours=self.cfg.DISPLAY_TZ_OFFSET))
-        _active_tabs: set = {
-            datetime.now(_tz).strftime("%m.%Y"),  # current month — always scan
-            self.cfg.GOOGLE_WORKSHEET_NAME,        # legacy / main tab
-        }
-        for _lid, _tab in self.state.get("lead_tab_by_lead", {}).items():
-            if self.state.get("sheet_status_by_lead", {}).get(_lid, "") not in _terminal_statuses:
-                _active_tabs.add(_tab)
+        # Always work with Sheet1 only. Sheet1 is the active tab; on month rollover
+        # it gets renamed to MM.YYYY and a fresh Sheet1 is created automatically by
+        # check_and_rotate_sheet(). Old month tabs are never scanned.
+        _active_tabs: set = {self.cfg.GOOGLE_WORKSHEET_NAME}
         rows = self.sheet.iter_lead_statuses(tabs_filter=_active_tabs)
         visible_ids = {item["lead_id"] for item in rows}
         self._detect_deleted_rows(visible_ids)
@@ -2235,6 +2328,19 @@ class SyncService:
             #    This prevents an infinite loop when a lead with a filled Заказ №
             #    is manually moved back to the trigger status by a manager.
             order_was_tracked = str(lead_id) in self.state.get("sheet_order_number_by_lead", {})
+            # Self-heal: lead is visible in the sheet but was never registered in
+            # sheet_order_number_by_lead (e.g. row was deleted and re-added externally,
+            # or the lead was imported without going through the trigger webhook path).
+            # Initialise with "" so the order-number trigger can fire this cycle if
+            # the admin has already filled Заказ №.
+            if not order_was_tracked:
+                self.remember_sheet_order_number(lead_id, "")
+                order_was_tracked = True
+                # known_order is already "" — get_known_order_number returns "" for absent keys
+            # Also self-heal tab tracking so _detect_deleted_rows and update_status
+            # route to the correct worksheet.
+            if str(lead_id) not in self.state.get("lead_tab_by_lead", {}):
+                self.remember_lead_tab(lead_id, item.get("tab_name", self.cfg.GOOGLE_WORKSHEET_NAME))
             if order_was_tracked and not known_order and order_number and status_name == "В процессе":
                 try:
                     lead_pipeline_id = self.get_lead_pipeline(lead_id)
@@ -2268,6 +2374,15 @@ class SyncService:
                         # not found we must NOT update state so the trigger retries
                         # on the next poll cycle (after a service restart or fix).
                         self.remember_sheet_order_number(lead_id, order_number)
+                        # Sheet status stays at "В процессе" — the order number was
+                        # entered but the parcel is not yet delivered.  Only when the
+                        # operator manually changes the sheet row to "У курера" will
+                        # the lead progress to AMO "Успешно реализовано".
+                        self.remember_sheet_status(lead_id, status_name)
+                        # Order# trigger handled this lead fully — skip the status
+                        # trigger below so it doesn't see the stale sheet status and
+                        # fire a conflicting AMO PATCH in the same poll cycle.
+                        continue
                     else:
                         _log_lead.warning(
                             "LEAD %s order# filled ('%s') but no 'Заказ отправлен' status ID found for pipeline %d",
@@ -2289,19 +2404,19 @@ class SyncService:
             # and the sheet value differs — covers both edits and clearing the cell.
             elif order_was_tracked and known_order and known_order != order_number:
                 try:
-                    # AMO custom field 987889 accepts an empty string to clear the value.
-                    patch_value = order_number  # may be "" to clear
-                    self.amo.patch(
-                        f"/api/v4/leads/{lead_id}",
-                        {
-                            "custom_fields_values": [
-                                {
-                                    "field_id": 987889,
-                                    "values": [{"value": patch_value}],
-                                }
-                            ],
-                        },
-                    )
+                    # For numeric AMO fields, sending "" raises a 400.
+                    # When clearing the cell, omit custom_fields_values entirely —
+                    # only push a new non-empty value to the AMO field.
+                    patch_body: Dict[str, Any] = {}
+                    if order_number:
+                        patch_body["custom_fields_values"] = [
+                            {"field_id": 987889, "values": [{"value": order_number}]}
+                        ]
+                    if not patch_body:
+                        # Nothing to push to AMO for a clear; just update local state.
+                        self.remember_sheet_order_number(lead_id, order_number)
+                        continue
+                    self.amo.patch(f"/api/v4/leads/{lead_id}", patch_body)
                     _log_lead.info(
                         "LEAD %s order# changed ('%s' → '%s') → AMO field updated",
                         lead_id, known_order, order_number,
@@ -2313,6 +2428,16 @@ class SyncService:
                             "Lead %s no longer exists in AMO (deleted/merged) — "
                             "suppressing order# update and marking as handled",
                             lead_id,
+                        )
+                        self.remember_sheet_order_number(lead_id, order_number)
+                    elif "failed: 400" in str(exc):
+                        # AMO rejected the value — most commonly happens when the field
+                        # is of type "numeric" and the sheet cell was cleared to "".
+                        # Record the current sheet value so we stop retrying this change.
+                        _log.warning(
+                            "LEAD %s order# update/clear rejected by AMO (400) — "
+                            "recording current value '%s' to suppress retries. Error: %s",
+                            lead_id, order_number, str(exc)[:200],
                         )
                         self.remember_sheet_order_number(lead_id, order_number)
                     else:
@@ -2353,9 +2478,9 @@ class SyncService:
                 # Translate the sheet status to the AMO display name we want to target
                 amo_lookup = SHEET_STATUS_TO_AMO_DISPLAY.get(status_name, status_name)
 
-                # When an operator moves a lead back to "В процессе" and the lead
-                # already has a Заказ №, it means the order was issued — push to
-                # ЗАКАЗ ОТПРАВЛЕН instead of ЗАКАЗ БЕЗ НУМЕРАЦИИ.
+                # When an operator explicitly sets the row back to "В процессе" and the
+                # lead already has a Заказ №, push to ЗАКАЗ ОТПРАВЛЕН.  Without an
+                # order number the standard "В процессе" lookup reaches ЗАКАЗ БЕЗ НУМЕРАЦИИ.
                 if status_name == "В процессе" and order_number:
                     amo_lookup = ORDER_NUM_FILLED_AMO_STATUS_DISPLAY  # "У курера" → ЗАКАЗ ОТПРАВЛЕН
 
@@ -2564,18 +2689,20 @@ def on_startup() -> None:
     # ── Twice-daily KPI scheduler ────────────────────────────────────────────
     # 13:00–14:00: midday live catch-up  (no snapshot, just refreshes kpi_events)
     # 23:00–00:00: nightly snapshot       (catch-up + freeze into manager_snapshots)
-    _state_file = os.path.join(os.path.dirname(__file__), ".sync_state.json")
+    # IMPORTANT: Use a SEPARATE file for KPI scheduler state so it never
+    # collides with / overwrites the sync service state in .sync_state.json.
+    _kpi_state_file = os.path.join(os.path.dirname(__file__), ".kpi_sched_state.json")
 
     def _load_sched_state() -> dict:
         try:
-            with open(_state_file) as _f:
+            with open(_kpi_state_file) as _f:
                 return json.load(_f)
         except Exception:
             return {}
 
     def _save_sched_state(state: dict) -> None:
         try:
-            with open(_state_file, "w") as _f:
+            with open(_kpi_state_file, "w") as _f:
                 json.dump(state, _f)
         except Exception as _exc:
             _log.warning("Could not save sched state: %s", _exc)
