@@ -57,10 +57,10 @@ COLUMNS = [
     "Тип продажи",
     "Продажа в рассрочку",
     "Воронка",
-    "статус",
+    "Статус",
 ]
 
-STATUS_COL_INDEX     = COLUMNS.index("статус")
+STATUS_COL_INDEX     = COLUMNS.index("Статус")
 STATUS_COL_LETTER    = chr(ord("A") + STATUS_COL_INDEX)   # e.g. "T"
 STATUS_DROPDOWN_OPTS = ["В процессе", "У курера", "Успешно", "Отказ"]
 

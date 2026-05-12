@@ -414,6 +414,78 @@ Operator sets sheet row "Статус" back → "В процессе" (order# "4
 | "Отказ" from sheet not reaching AMO | Lookup key wrong — must be `"Отказ"` (display name), not `"ОТКАЗ"` (raw AMO name). |
 | Status "Успешно" written to sheet from AMO webhook | The "Успешно" suppression was removed — it must always be present in both the terminal block and the non-terminal block of `process_webhook_leads`. |
 | Sheet "Успешно" triggers an AMO PATCH | `sync_sheet_to_amo` must `continue` immediately when `status_name == "Успешно"`. |
+| Same lead inserted 5–10× on the same date | Race condition: `iter_lead_statuses` wiped recently-inserted rows from the index. See §15. |
+| New rows written starting from column B (Компания column is empty/shifted) | `append_rows` called without `table_range="A1"`. See §15. |
+
+---
+
+## 15. Known Bugs Fixed (Do Not Reintroduce)
+
+### BUG-1 — Duplicate row inserts (race condition in `iter_lead_statuses`)
+
+**Symptom:** Same lead appears 5–10 times on the same date, each at a different
+row number (e.g. lead 41933085 inserted at rows 1739, 1820, 1888, 1950, … on
+2026-05-11).
+
+**Root cause:**
+Two threads share `self._row_index` (the `lead_id → row_number` in-memory map):
+- **Webhook worker** (`upsert_row`): inserts a row → stores `lead_id → row_N`
+  in `self._row_index` under `self.lock`.
+- **Sync thread** (`iter_lead_statuses`): reads the sheet via `get_all_values()`
+  to refresh the index. But Google Sheets has a short cache/propagation lag — a
+  row that was just appended with `append_rows()` may not appear in an
+  immediately subsequent `get_all_values()` response. The old code then
+  **completely replaced** `self._row_index[tab_name]` with the stale data,
+  wiping the just-inserted lead from the index.
+
+When AMO retried the webhook (after the 60 s dedup TTL), `upsert_row` found no
+entry in the index → inserted the lead again. This repeated every ~11–22 minutes
+as long as AMO kept retrying.
+
+**Fix applied** (`sync_service.py` — `iter_lead_statuses`):
+Instead of replacing the index, **merge under `self.lock`**: start from the
+old in-memory index, overwrite with the authoritative sheet values, so that
+recently-inserted rows not yet visible in the Sheets API cache are preserved.
+```python
+with self.lock:
+    old_idx = self._row_index.get(tab_name, {})
+    merged = {**old_idx, **new_idx}   # new_idx wins for shared keys
+    self._row_index[tab_name] = merged
+    self._row_count[tab_name] = last_data_row
+```
+
+**Do NOT change** `iter_lead_statuses` to replace the index outright without
+the merge — that reintroduces this race condition.
+
+---
+
+### BUG-2 — New rows written starting from column B (data shifted right)
+
+**Symptom:** Newly inserted sheet rows have "Компания" (col A) empty and the
+data starting from column B, making the ID column appear in column A visually.
+
+**Root cause:**
+`gspread`'s `append_rows()` calls the Google Sheets `values.append` API. When
+`table_range` is not specified, the API auto-detects the "logical table" range
+by scanning the sheet from the top. Because many rows have an empty "Компания"
+column (AMO leads with no linked company), the API detected the table as
+starting at column B — and inserted new rows starting from column B too,
+shifting every cell one column to the right.
+
+**Fix applied** (`sync_service.py` — `upsert_row`):
+Pass `table_range="A1"` explicitly:
+```python
+result = ws.append_rows(
+    [row_data],
+    value_input_option="USER_ENTERED",
+    insert_data_option="INSERT_ROWS",
+    table_range="A1",   # ← anchor at A1 so inserts always start at col A
+)
+```
+
+**Do NOT remove** `table_range="A1"` from the `append_rows` call. Without it
+the column-shift bug returns any time a batch of leads without a company is
+inserted.
 
 ---
 

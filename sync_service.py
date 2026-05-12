@@ -719,11 +719,13 @@ class SheetSync:
                 ws.freeze(rows=1)
                 # Header changed — row index is stale
                 self._invalidate_row_index(name)
-                # Apply dropdown only when creating/resetting the sheet so we
-                # don't overwrite existing Google Sheets validation on every restart.
-                status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-                self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
-                
+            # Always clean up stale validation rules from old column positions
+            # and re-apply the dropdown only to the correct status column.
+            # This handles the case where columns were added/reordered since
+            # the sheet was first set up (e.g. Продажа в рассрочку / Воронка
+            # inserted before Статус, leaving old dropdown rules on S and T).
+            self._fix_sheet_validation(ws)
+
         self._sheets[name] = ws
         return ws
 
@@ -748,10 +750,8 @@ class SheetSync:
             ws.update(values=[COLUMNS], range_name="A1")
             ws.freeze(rows=1)
             self._invalidate_row_index(tab_name)
-            # Apply dropdown only when creating/resetting the sheet so we
-            # don't overwrite existing Google Sheets validation on every restart.
-            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-            self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
+        # Always clean up stale validation rules from old column positions.
+        self._fix_sheet_validation(ws)
         self._sheets[tab_name] = ws
         return ws
 
@@ -809,6 +809,47 @@ class SheetSync:
 
     # Statuses that can be chosen from the dropdown in the "Статус" column
     STATUS_DROPDOWN_OPTIONS = ["В процессе", "У курера", "Успешно", "Отказ"]
+
+    def _clear_column_validation(self, ws, row_range: str) -> None:
+        """Remove any data-validation rule from *row_range*.
+
+        Used to wipe stale dropdown rules left on columns that previously held
+        the status column before new columns were inserted in front of it.
+        """
+        try:
+            body = {
+                "requests": [
+                    {
+                        "setDataValidation": {
+                            "range": __import__('gspread').utils.a1_range_to_grid_range(
+                                row_range, ws.id
+                            ),
+                            # Omitting 'rule' clears any existing validation on the range.
+                        }
+                    }
+                ]
+            }
+            ws.client.batch_update(ws.spreadsheet_id, body)
+        except Exception as e:
+            _log.warning("Could not clear validation on %s: %s", row_range, e)
+
+    def _fix_sheet_validation(self, ws) -> None:
+        """Ensure the status dropdown exists ONLY on the status column.
+
+        Clears any validation rules on all other columns in the data area
+        (rows 2-2000) so that stale dropdown rules left from a previous column
+        layout (e.g. before Продажа в рассрочку / Воронка were added) are
+        removed.  Then (re-)applies the dropdown to the correct status column.
+        """
+        status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+        # Clear every column in the sheet except the status column.
+        for i in range(len(COLUMNS)):
+            if i == STATUS_COL_INDEX:
+                continue
+            col_letter = chr(ord("A") + i)
+            self._clear_column_validation(ws, f"{col_letter}2:{col_letter}2000")
+        # (Re-)apply the correct dropdown on the status column.
+        self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
 
     def _apply_status_dropdown(self, ws, row_range: str) -> None:
         """Apply a dropdown validation to the status column for the given row range.
@@ -978,10 +1019,16 @@ class SheetSync:
             # is always placed directly after the last real data row on the sheet,
             # regardless of whether _row_count is stale (e.g. after an external
             # manual deletion).  This prevents gaps / empty rows from accumulating.
+            # table_range="A1" anchors the Sheets API table-detection at A1 so that
+            # new rows are always inserted starting from column A, even when many
+            # rows have an empty column A (e.g. leads with no company in AMO).
+            # Without this anchor, the API can mis-detect the table as starting at
+            # column B and write the entire row shifted one column to the right.
             result = ws.append_rows(
                 [row_data],
                 value_input_option="USER_ENTERED",
                 insert_data_option="INSERT_ROWS",
+                table_range="A1",
             )
             # Parse the actual row number from the API response:
             # result["updates"]["updatedRange"] = "SheetName!A51:T51"
@@ -1077,11 +1124,21 @@ class SheetSync:
                         "order_number": order_number,
                         "tab_name": tab_name,
                     })
-                # Atomically replace the cached row index with the fresh one.
-                # This prevents update_status from writing to wrong rows when
-                # external scripts or users insert/delete rows between poll cycles.
-                self._row_index[tab_name] = new_idx
-                self._row_count[tab_name] = last_data_row
+                # Merge under lock: prefer the authoritative sheet data (new_idx)
+                # for any row already visible in the sheet, but preserve in-memory
+                # entries that were inserted AFTER the get_all_values() call above.
+                # Google Sheets has a short cache/propagation lag — a row appended
+                # by upsert_row may not appear in an immediately subsequent
+                # get_all_values() response, which would wipe the entry from the
+                # index and cause upsert_row to insert a duplicate on the next call.
+                with self.lock:
+                    old_idx = self._row_index.get(tab_name, {})
+                    # Start from old in-memory index, then overwrite with
+                    # authoritative sheet values so row numbers stay correct
+                    # after external edits while still protecting recent inserts.
+                    merged = {**old_idx, **new_idx}
+                    self._row_index[tab_name] = merged
+                    self._row_count[tab_name] = last_data_row
             except Exception as exc:
                 _log.warning("iter_lead_statuses: could not read tab '%s': %s", tab_name, exc)
         return out

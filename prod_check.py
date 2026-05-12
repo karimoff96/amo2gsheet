@@ -67,7 +67,7 @@ COLUMNS: List[str] = [
     "Тип продажи",
     "Продажа в рассрочку",
     "Воронка",
-    "статус",
+    "Статус",
 ]
 
 # These columns are NOT AMO lead custom fields — they come from standard lead/
@@ -80,7 +80,7 @@ NON_CUSTOM_FIELD_COLS = {
     "Бюджет сделки",    # lead.price
     "Ответственный",    # resolved from responsible_user_id
     "Воронка",          # resolved from pipeline_id
-    "статус",           # resolved from status_id
+    "Статус",           # resolved from status_id
 }
 
 # Columns that MUST be AMO lead custom fields
@@ -96,7 +96,7 @@ except Exception:
     pass
 
 STATUS_DROPDOWN_OPTS = ["В процессе", "У курера", "Успешно", "Отказ"]
-STATUS_COL_INDEX     = COLUMNS.index("статус")
+STATUS_COL_INDEX     = COLUMNS.index("Статус")
 STATUS_COL_LETTER    = chr(ord("A") + STATUS_COL_INDEX)
 
 # ─────────────────────────────────────────────────────────────────────────────
