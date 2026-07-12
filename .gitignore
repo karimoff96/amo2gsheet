@@ -11,6 +11,7 @@ prod_gsheet.json
 .amo_tokens_prod.json
 # Runtime state — auto-generated
 .sync_state.json
+.sync_state.backup_*.json
 # Python cache
 __pycache__/
 *.pyc

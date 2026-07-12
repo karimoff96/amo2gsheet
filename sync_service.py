@@ -146,6 +146,20 @@ ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
 
+
+class SheetIntegrityError(RuntimeError):
+    """Raised when a lead worksheet is not safe to read from or write to.
+
+    This exception is deliberately fail-closed: callers must not continue with
+    a partial scan or attempt to reconstruct the header in-place.  A misplaced
+    header can make the Sheets append API insert at row 1 and can make cached row
+    numbers point at a different lead.
+    """
+
+
+class DuplicateLeadIdError(SheetIntegrityError):
+    """Raised when an update targets an ID that occurs more than once."""
+
 # ── Normalization for AMO status names ─────────────────────────────────────────
 # Some pipelines (e.g. Rushana) have status names with mixed Latin/Cyrillic
 # lookalike characters (Latin 'A'→Cyrillic 'А', 'O'→'О', etc.) and non-standard
@@ -276,6 +290,11 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "gsheet.json").strip()
     GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
     GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1").strip()
+    GOOGLE_SHEET_OWNER_EMAILS = frozenset(
+        email.strip().casefold()
+        for email in os.getenv("GOOGLE_SHEET_OWNER_EMAILS", "").split(",")
+        if email.strip()
+    )
 
     TRIGGER_STATUS_ID = int(os.getenv("TRIGGER_STATUS_ID", "0"))
     PIPELINE_ID = int(os.getenv("PIPELINE_ID", "0"))
@@ -300,7 +319,10 @@ class Config:
     STAFF_CACHE_TTL_SEC = int(os.getenv("STAFF_CACHE_TTL_SEC", "300"))
     # If the same (lead_id, status_id) webhook arrives again within this window, skip it.
     # Prevents repeated AMO API calls caused by amoCRM’s own webhook retry logic.
-    WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("WEBHOOK_DEDUP_TTL_SEC", "60"))
+    WEBHOOK_DEDUP_TTL_SEC = int(os.getenv("WEBHOOK_DEDUP_TTL_SEC", "300"))
+    # catch_up_trigger_leads only fetches leads updated within this many days.
+    # Keeps the catch-up query focused on recent activity; increase to include older records.
+    CATCH_UP_DAYS = int(os.getenv("CATCH_UP_DAYS", "3"))
     # Leads created before this timestamp are silently ignored (0 = process all).
     # Supports human-readable 'DD.MM.YYYY HH:MM:SS' (UTC) or plain Unix timestamp.
     LEADS_CREATED_AFTER = _parse_leads_created_after(os.getenv("LEADS_CREATED_AFTER", "0"))
@@ -321,6 +343,7 @@ def require_env() -> None:
         "AMO_CLIENT_SECRET",
         "AMO_REDIRECT_URI",
         "GOOGLE_SHEET_ID",
+        "GOOGLE_SHEET_OWNER_EMAILS",
     ]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
@@ -684,76 +707,360 @@ class SheetSync:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.gc = gspread.service_account(filename=cfg.GOOGLE_SERVICE_ACCOUNT_FILE)
+        google_credentials = (
+            getattr(self.gc, "auth", None)
+            or getattr(getattr(self.gc, "http_client", None), "auth", None)
+        )
+        self._service_account_email = str(
+            getattr(google_credentials, "service_account_email", "")
+            or ""
+        ).strip()
+        if not self._service_account_email:
+            try:
+                credentials_data = json.loads(
+                    Path(cfg.GOOGLE_SERVICE_ACCOUNT_FILE).read_text(encoding="utf-8")
+                )
+                self._service_account_email = str(
+                    credentials_data.get("client_email", "")
+                ).strip()
+            except Exception:
+                pass
+        if not self._service_account_email:
+            raise RuntimeError(
+                "Google service-account email is required for strict sheet protection"
+            )
+        self._trusted_protection_editor_users = {
+            self._service_account_email.casefold(),
+            *{
+                str(email).strip().casefold()
+                for email in getattr(cfg, "GOOGLE_SHEET_OWNER_EMAILS", set())
+                if str(email).strip()
+            },
+        }
         self.spreadsheet = self.gc.open_by_key(cfg.GOOGLE_SHEET_ID)
-        self.lock = threading.Lock()
+        # A re-entrant lock protects worksheet mutations and every read/replace of
+        # the row-index caches.  Several public methods call locked helpers, so a
+        # plain Lock would deadlock while an unlocked helper would allow a stale
+        # scanner result to replace a newer writer's index.
+        self.lock = threading.RLock()
         # Cache of worksheet objects keyed by tab name
         self._sheets: Dict[str, Any] = {}
         # Staff mapping cache – refreshed every STAFF_CACHE_TTL_SEC seconds
         self._staff_cache: Dict[str, str] = {}
         self._staff_cache_ts: float = 0.0
         # In-memory row index: ws_name → {lead_id → 1-based row number}
-        # A single get_all_values() builds the index; all subsequent find_row / upsert
-        # calls are O(1) dict lookups with no additional Sheets API calls.
+        # Writers rebuild it from a live validated snapshot before mutating; this
+        # favors correctness over saving one Sheets read.
         self._row_index: Dict[str, Dict[str, int]] = {}
         self._row_count: Dict[str, int] = {}  # ws_name → last occupied row number
+        self._duplicate_ids: Dict[str, set[str]] = {}
+        self._row_snapshots: Dict[str, List[Any]] = {}
+        # Recently verified writes survive a temporarily stale get_all_values()
+        # response.  ws_name → lead_id → {row, timestamp}.
+        self._recent_verified_rows: Dict[str, Dict[str, Dict[str, Any]]] = {}
         # Cache of worksheet titles — refreshed at most once every 120 s to avoid
         # a metadata fetch on every poll cycle.
         self._ws_titles_cache: List[str] = []
         self._ws_titles_ts: float = 0.0
 
-    def _get_or_create_sheet(self, name: str):
-        if name in self._sheets:
-            return self._sheets[name]
-        # Always re-fetch spreadsheet metadata first to avoid stale cache issues
-        self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+    def _live_sheet_properties(self, ws) -> Dict[str, Any]:
+        """Return live title/freeze metadata, not cached Worksheet properties."""
+        fetch_metadata = getattr(getattr(ws, "client", None), "fetch_sheet_metadata", None)
+        if not callable(fetch_metadata):
+            # Compatibility fallback for test doubles and older gspread clients.
+            # Production gspread exposes fetch_sheet_metadata, so production always
+            # checks the live value from Google before processing lead rows.
+            return {
+                "title": str(getattr(ws, "title", "")),
+                "frozen_rows": int(getattr(ws, "frozen_row_count", 0) or 0),
+                "sheet_protected": False,
+            }
         try:
-            ws = self.spreadsheet.worksheet(name)
-        except gspread.WorksheetNotFound:
-            ws = self.spreadsheet.add_worksheet(title=name, rows=2000, cols=max(26, len(COLUMNS)))
-        
-        # Only enforce main columns on the main worksheet
-        if name == self.cfg.GOOGLE_WORKSHEET_NAME:
-            first_row = ws.row_values(1)
-            if first_row != COLUMNS:
-                ws.update(values=[COLUMNS], range_name="A1")
+            metadata = fetch_metadata(
+                ws.spreadsheet_id, params={"includeGridData": "false"}
+            )
+            for sheet in metadata.get("sheets", []):
+                props = sheet.get("properties", {})
+                if int(props.get("sheetId", -1)) == int(ws.id):
+                    sheet_protected = False
+                    for protected in sheet.get("protectedRanges", []):
+                        protected_range = protected.get("range") or {}
+                        if int(protected_range.get("sheetId", -1)) != int(ws.id):
+                            continue
+                        protects_whole_sheet = (
+                            int(protected_range.get("startRowIndex", 0) or 0) == 0
+                            and int(protected_range.get("startColumnIndex", 0) or 0) == 0
+                            and "endRowIndex" not in protected_range
+                            and "endColumnIndex" not in protected_range
+                        )
+                        unprotected_ranges = protected.get(
+                            "unprotectedRanges", []
+                        )
+                        unprotected_columns = set()
+                        unprotected_shape_valid = True
+                        for allowed in unprotected_ranges:
+                            if (
+                                int(allowed.get("sheetId", -1)) != int(ws.id)
+                                or int(allowed.get("startRowIndex", -1)) != 1
+                                or "endRowIndex" in allowed
+                            ):
+                                unprotected_shape_valid = False
+                                break
+                            unprotected_columns.add((
+                                int(allowed.get("startColumnIndex", -1)),
+                                int(allowed.get("endColumnIndex", -1)),
+                            ))
+                        expected_unprotected_columns = {
+                            (ORDER_NUM_COL_INDEX, ORDER_NUM_COL_INDEX + 1),
+                            (STATUS_COL_INDEX, STATUS_COL_INDEX + 1),
+                        }
+                        editors = protected.get("editors") or {}
+                        editor_users = {
+                            str(user).strip().casefold()
+                            for user in editors.get("users", [])
+                            if str(user).strip()
+                        }
+                        # Google includes spreadsheet owners in protected-range
+                        # metadata even when addProtectedRange names only the
+                        # service account.  Trust only the configured owner(s),
+                        # never an arbitrary second user.
+                        editors_are_strict = (
+                            editor_users
+                            == self._trusted_protection_editor_users
+                            and not editors.get("groups")
+                            and not editors.get("domainUsersCanEdit", False)
+                        )
+                        if (
+                            protects_whole_sheet
+                            and not protected.get("warningOnly", False)
+                            and unprotected_shape_valid
+                            and len(unprotected_ranges) == 2
+                            and unprotected_columns == expected_unprotected_columns
+                            and editors_are_strict
+                        ):
+                            sheet_protected = True
+                            break
+                    return {
+                        "title": str(props.get("title", "")),
+                        "frozen_rows": int(
+                            (props.get("gridProperties") or {}).get(
+                                "frozenRowCount", 0
+                            ) or 0
+                        ),
+                        "sheet_protected": sheet_protected,
+                    }
+        except Exception as exc:
+            raise SheetIntegrityError(
+                f"Could not verify frozen header for worksheet '{ws.title}': {exc}"
+            ) from exc
+        raise SheetIntegrityError(
+            f"Could not find worksheet '{ws.title}' in live spreadsheet metadata"
+        )
+
+    def _assert_sheet_integrity_locked(
+        self, ws, all_vals: List[Any], expected_title: str = ""
+    ) -> None:
+        """Validate the exact lead header and one frozen row, or stop safely."""
+        actual_header = list(all_vals[0]) if all_vals else []
+        if actual_header != COLUMNS:
+            _log_lead.critical(
+                "SHEET INTEGRITY BLOCKED tab='%s': row 1 is not the exact header; "
+                "expected=%s actual=%s. No rows will be read or written.",
+                ws.title, COLUMNS, actual_header,
+            )
+            raise SheetIntegrityError(
+                f"Worksheet '{ws.title}' row 1 is not the exact expected header"
+            )
+
+        embedded_header_rows = [
+            row_number
+            for row_number, row in enumerate(all_vals[1:], start=2)
+            if list(row[:len(COLUMNS)]) == COLUMNS
+        ]
+        if embedded_header_rows:
+            _log_lead.critical(
+                "SHEET INTEGRITY BLOCKED tab='%s': duplicate header found in "
+                "data row(s) %s. No rows will be read or written.",
+                ws.title, embedded_header_rows,
+            )
+            raise SheetIntegrityError(
+                f"Worksheet '{ws.title}' contains a header inside its data rows: "
+                f"{embedded_header_rows}"
+            )
+
+        live_props = self._live_sheet_properties(ws)
+        live_title = live_props["title"]
+        expected_title = expected_title or ws.title
+        if live_title != expected_title:
+            _log_lead.critical(
+                "SHEET INTEGRITY BLOCKED: cached tab='%s' sheetId=%s is now "
+                "named '%s'. No rows will be read or written.",
+                expected_title, ws.id, live_title,
+            )
+            raise SheetIntegrityError(
+                f"Worksheet '{expected_title}' now points to live title "
+                f"'{live_title}' (sheetId={ws.id})"
+            )
+
+        if not live_props.get("sheet_protected", False):
+            _log_lead.critical(
+                "SHEET INTEGRITY BLOCKED tab='%s': strict whole-sheet protection "
+                "with only C2:C and U2:U editable is missing. No rows will be "
+                "read or written.",
+                ws.title,
+            )
+            raise SheetIntegrityError(
+                f"Worksheet '{ws.title}' does not have the required structural protection"
+            )
+
+        frozen_rows = int(live_props["frozen_rows"])
+        if frozen_rows != 1:
+            # Freezing/unfreezing changes metadata only and cannot overwrite lead
+            # data.  Restore the invariant automatically, then verify it live.
+            try:
                 ws.freeze(rows=1)
-                # Header changed — row index is stale
-                self._invalidate_row_index(name)
-            # Always clean up stale validation rules from old column positions
-            # and re-apply the dropdown only to the correct status column.
-            # This handles the case where columns were added/reordered since
-            # the sheet was first set up (e.g. Продажа в рассрочку / Воронка
-            # inserted before Статус, leaving old dropdown rules on S and T).
-            self._fix_sheet_validation(ws)
+                frozen_rows = int(
+                    self._live_sheet_properties(ws)["frozen_rows"]
+                )
+            except Exception as exc:
+                raise SheetIntegrityError(
+                    f"Could not restore frozen header for '{ws.title}': {exc}"
+                ) from exc
+            if frozen_rows != 1:
+                _log_lead.critical(
+                    "SHEET INTEGRITY BLOCKED tab='%s': could not restore exactly "
+                    "1 frozen header row (found %d). No rows will be read or written.",
+                    ws.title, frozen_rows,
+                )
+                raise SheetIntegrityError(
+                    f"Worksheet '{ws.title}' must have exactly one frozen header row"
+                )
+            _log_lead.warning(
+                "SHEET HEADER FREEZE restored automatically for tab='%s'", ws.title
+            )
 
-        self._sheets[name] = ws
-        return ws
+    def _read_validated_values_locked(self, ws) -> List[List[str]]:
+        """Read a worksheet and validate its live safety invariants."""
+        all_vals = ws.get_all_values()
+        self._assert_sheet_integrity_locked(ws, all_vals)
+        return all_vals
 
-    def _get_or_create_month_sheet(self, tab_name: str):
+    def _initialize_lead_sheet_locked(self, ws) -> None:
+        """Initialize a newly-created (and therefore empty) lead worksheet."""
+        last_col = chr(ord("A") + len(COLUMNS) - 1)
+        ws.update(values=[COLUMNS], range_name=f"A1:{last_col}1")
+        ws.freeze(rows=1)
+        try:
+            ws.client.batch_update(
+                ws.spreadsheet_id,
+                {
+                    "requests": [
+                        {
+                            "addProtectedRange": {
+                                "protectedRange": {
+                                    "range": {
+                                        "sheetId": ws.id,
+                                    },
+                                    "unprotectedRanges": [
+                                        {
+                                            "sheetId": ws.id,
+                                            "startRowIndex": 1,
+                                            "startColumnIndex": ORDER_NUM_COL_INDEX,
+                                            "endColumnIndex": ORDER_NUM_COL_INDEX + 1,
+                                        },
+                                        {
+                                            "sheetId": ws.id,
+                                            "startRowIndex": 1,
+                                            "startColumnIndex": STATUS_COL_INDEX,
+                                            "endColumnIndex": STATUS_COL_INDEX + 1,
+                                        },
+                                    ],
+                                    "description": (
+                                        "amo2gsheet structural lock; operators may "
+                                        "edit only order number and status"
+                                    ),
+                                    "warningOnly": False,
+                                    "editors": {
+                                        "users": [self._service_account_email],
+                                    },
+                                }
+                            }
+                        }
+                    ]
+                },
+            )
+        except Exception as exc:
+            raise SheetIntegrityError(
+                f"Could not structurally protect new worksheet '{ws.title}': {exc}"
+            ) from exc
+        self._invalidate_row_index(ws.title, reset_high_water=True)
+        # Verify both writes reached Google before the worksheet becomes usable.
+        self._read_validated_values_locked(ws)
+
+    def _get_or_create_sheet(self, name: str):
+        with self.lock:
+            if name in self._sheets:
+                return self._sheets[name]
+            # Always re-fetch spreadsheet metadata first to avoid stale cache issues.
+            self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+            created = False
+            try:
+                ws = self.spreadsheet.worksheet(name)
+            except gspread.WorksheetNotFound:
+                ws = self.spreadsheet.add_worksheet(
+                    title=name, rows=2000, cols=max(26, len(COLUMNS))
+                )
+                created = True
+
+            # Only lead worksheets have the strict schema.  Staff has a different
+            # header and must not be validated against COLUMNS.
+            if name == self.cfg.GOOGLE_WORKSHEET_NAME:
+                if created:
+                    self._initialize_lead_sheet_locked(ws)
+                else:
+                    self._read_validated_values_locked(ws)
+                # Always clean up stale validation rules from old column positions
+                # and re-apply the dropdown only to the correct status column.
+                self._fix_sheet_validation(ws)
+
+            self._sheets[name] = ws
+            return ws
+
+    def _get_or_create_month_sheet(
+        self, tab_name: str, allow_create: bool = False
+    ):
         """Return (and lazily create) the worksheet for the given month tab.
 
         Tab names are typically "MM.YYYY" (e.g. "03.2026").  The sheet is
         created with column headers, a frozen header row, and a status-column
         dropdown when it does not yet exist.
         """
-        if tab_name in self._sheets:
-            return self._sheets[tab_name]
-        # Re-fetch spreadsheet metadata to avoid stale cache issues
-        self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
-        try:
-            ws = self.spreadsheet.worksheet(tab_name)
-        except gspread.WorksheetNotFound:
-            ws = self.spreadsheet.add_worksheet(title=tab_name, rows=2000, cols=max(26, len(COLUMNS)))
-        # Ensure column headers are in place
-        first_row = ws.row_values(1)
-        if first_row != COLUMNS:
-            ws.update(values=[COLUMNS], range_name="A1")
-            ws.freeze(rows=1)
-            self._invalidate_row_index(tab_name)
-        # Always clean up stale validation rules from old column positions.
-        self._fix_sheet_validation(ws)
-        self._sheets[tab_name] = ws
-        return ws
+        with self.lock:
+            if tab_name in self._sheets:
+                return self._sheets[tab_name]
+            # Re-fetch spreadsheet metadata to avoid stale cache issues.
+            self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+            created = False
+            try:
+                ws = self.spreadsheet.worksheet(tab_name)
+            except gspread.WorksheetNotFound as exc:
+                if not allow_create:
+                    raise SheetIntegrityError(
+                        f"Expected worksheet '{tab_name}' is missing; refusing to "
+                        "create an empty replacement during normal sync"
+                    ) from exc
+                ws = self.spreadsheet.add_worksheet(
+                    title=tab_name, rows=2000, cols=max(26, len(COLUMNS))
+                )
+                created = True
+            if created:
+                self._initialize_lead_sheet_locked(ws)
+            else:
+                self._read_validated_values_locked(ws)
+            # Always clean up stale validation rules from old column positions.
+            self._fix_sheet_validation(ws)
+            self._sheets[tab_name] = ws
+            return ws
 
     def rotate_to_archive(self, archive_tab_name: str) -> None:
         """Rename the current active worksheet to archive_tab_name, then create a
@@ -764,6 +1071,7 @@ class SheetSync:
             # Rename the existing active sheet to the archive name
             try:
                 ws = self.spreadsheet.worksheet(main_name)
+                self._read_validated_values_locked(ws)
                 ws.update_title(archive_tab_name)
                 _log.info("Worksheet '%s' renamed to '%s'", main_name, archive_tab_name)
             except gspread.WorksheetNotFound:
@@ -772,8 +1080,8 @@ class SheetSync:
             self._sheets.pop(main_name, None)
             self._sheets.pop(archive_tab_name, None)
             # Invalidate row indices for both old and new tab names
-            self._invalidate_row_index(main_name)
-            self._invalidate_row_index(archive_tab_name)
+            self._invalidate_row_index(main_name, reset_high_water=True)
+            self._invalidate_row_index(archive_tab_name, reset_high_water=True)
             # Create (or re-open) a new active sheet with headers + dropdown
             self._get_or_create_sheet(main_name)
             _log.info("New active worksheet '%s' created for the new month.", main_name)
@@ -874,195 +1182,390 @@ class SheetSync:
         return values[1:]
 
     # ── Row index cache ───────────────────────────────────────────────────────
-    # Eliminates repeated get_all_values() calls.  Built once per worksheet on
-    # first access; updated in O(1) whenever a row is appended or header reset.
+    # All cache replacements and sheet mutations happen under self.lock.
 
-    def _purge_empty_rows(self, ws, ws_name: str, all_vals: List[Any]) -> List[Any]:
-        """Delete fully-blank rows (excluding header row 1) from *ws*.
+    def _refresh_row_index_locked(
+        self, ws, ws_name: str, all_vals: Optional[List[Any]] = None
+    ) -> Dict[str, int]:
+        """Atomically replace the row index from one validated sheet snapshot.
 
-        Called once at cold-start from _build_row_index.  Returns the cleaned
-        list of rows so the caller can build the index without a second API fetch.
-        Consecutive empty rows are batched into a single delete_rows() call to
-        minimise API quota usage.  Deletion is done in reverse order so that
-        row indices above the deleted range remain stable throughout.
+        Duplicate IDs are intentionally excluded from the index.  The bot never
+        guesses which duplicate is authoritative and never deletes either row.
         """
-        # Collect 1-based indices of empty data rows (skip index 0 = header)
-        empty: List[int] = [
-            i + 1
-            for i, row in enumerate(all_vals)
-            if i > 0 and not any(str(cell).strip() for cell in row)
-        ]
-        if not empty:
-            return all_vals
+        if all_vals is None:
+            all_vals = self._read_validated_values_locked(ws)
+        else:
+            self._assert_sheet_integrity_locked(ws, all_vals, ws_name)
 
-        _log_lead.info("SHEET '%s': found %d empty row(s) — removing.", ws_name, len(empty))
-
-        # Group consecutive indices so we can delete ranges in one call each
-        groups: List[tuple] = []
-        start = end = empty[-1]
-        for r in reversed(empty[:-1]):
-            if r == start - 1:
-                start = r
-            else:
-                groups.append((start, end))
-                start = end = r
-        groups.append((start, end))
-
-        deleted = 0
-        for s, e in groups:
-            ws.delete_rows(s, e)
-            deleted += e - s + 1
-            _log_lead.info("SHEET '%s': deleted empty rows %d–%d (%d row(s)).", ws_name, s, e, e - s + 1)
-
-        _log_lead.info("SHEET '%s': purged %d empty row(s) total.", ws_name, deleted)
-
-        # Return the cleaned data so _build_row_index doesn't need a second fetch
-        cleaned = [row for i, row in enumerate(all_vals)
-                   if i + 1 not in set(empty)]
-        return cleaned
-
-    def _purge_duplicate_rows(self, ws, ws_name: str, all_vals: List[Any]) -> List[Any]:
-        """Delete rows where the same lead ID appears more than once, keeping the LAST
-        occurrence so the in-memory row index stays consistent with what we update later.
-
-        Called once at cold-start (or index rebuild) from _build_row_index, right after
-        _purge_empty_rows.  Deletions run in reverse row-number order to avoid index
-        shifting.  Returns the cleaned list of rows.
-        """
-        # Map lead_id → list of ALL 1-based row indices where it appears
         occurrences: Dict[str, List[int]] = {}
-        for i, row in enumerate(all_vals):
-            if i == 0:
-                continue  # skip header
-            if len(row) > ID_COL_INDEX:
-                lid = str(row[ID_COL_INDEX]).strip()
-                if lid:
-                    occurrences.setdefault(lid, []).append(i + 1)  # 1-based index in all_vals
-
-        # Collect row indices to remove (all but the last occurrence per lead_id)
-        to_delete: set = set()
-        for lid, row_nums in occurrences.items():
-            if len(row_nums) > 1:
-                earlier = row_nums[:-1]
-                _log_lead.warning(
-                    "SHEET '%s': lead %s has %d duplicate rows — removing rows %s, keeping row %d",
-                    ws_name, lid, len(row_nums), earlier, row_nums[-1],
-                )
-                to_delete.update(earlier)
-
-        if not to_delete:
-            return all_vals
-
-        # Delete from highest row to lowest so that row indices below each deletion
-        # remain valid throughout the loop.
-        for row_num in sorted(to_delete, reverse=True):
-            ws.delete_rows(row_num)
-
-        _log_lead.info("SHEET '%s': purged %d duplicate lead row(s).", ws_name, len(to_delete))
-
-        # Return a cleaned list (keeps rows whose 1-based index is NOT in to_delete)
-        return [row for i, row in enumerate(all_vals) if (i + 1) not in to_delete]
-
-    def _build_row_index(self, ws, ws_name: str) -> None:
-        """Read the sheet once, purge empty + duplicate rows, then build lead_id → row mapping."""
-        all_vals = ws.get_all_values()
-
-        # Remove blank rows left over from manual sheet clears.
-        all_vals = self._purge_empty_rows(ws, ws_name, all_vals)
-        # Remove duplicate lead-ID rows (keep last occurrence per ID).
-        all_vals = self._purge_duplicate_rows(ws, ws_name, all_vals)
-
-        idx: Dict[str, int] = {}
-        last_data_row = 0
+        last_data_row = 1  # a valid worksheet always has the header at row 1
         for i, row in enumerate(all_vals):
             if any(str(cell).strip() for cell in row):
-                last_data_row = i + 1  # track last row with any content
-            if i == 0:
-                continue  # skip header
-            if len(row) > ID_COL_INDEX:
-                lid = str(row[ID_COL_INDEX]).strip()
-                if lid:
-                    idx[lid] = i + 1  # 1-based row number
+                last_data_row = i + 1
+            if i == 0 or len(row) <= ID_COL_INDEX:
+                continue
+            lead_id = str(row[ID_COL_INDEX]).strip()
+            if lead_id:
+                occurrences.setdefault(lead_id, []).append(i + 1)
+
+        duplicates = {lead_id for lead_id, rows in occurrences.items() if len(rows) > 1}
+        previous_duplicates = self._duplicate_ids.get(ws_name, set())
+        if duplicates and duplicates != previous_duplicates:
+            details = {
+                lead_id: occurrences[lead_id] for lead_id in sorted(duplicates)
+            }
+            _log_lead.critical(
+                "SHEET DUPLICATE IDs tab='%s': %s. These IDs are quarantined; "
+                "no Sheet or AMO updates will be made for them.",
+                ws_name, details,
+            )
+
+        idx = {
+            lead_id: rows[0]
+            for lead_id, rows in occurrences.items()
+            if lead_id not in duplicates
+        }
         self._row_index[ws_name] = idx
-        # Use the last *non-empty* row so that blank rows left over from a
-        # manual sheet clear are not counted — new data will fill from
-        # directly after the last real row instead of after the blanks.
-        self._row_count[ws_name] = last_data_row
+        self._row_snapshots[ws_name] = all_vals
+        # Never lower the observed high-water mark inside a running process.  A
+        # Sheets read can briefly omit a just-written trailing row; retaining the
+        # mark helps recent-write recovery and diagnostics remain conservative.
+        self._row_count[ws_name] = max(
+            self._row_count.get(ws_name, 1), last_data_row
+        )
+        self._duplicate_ids[ws_name] = duplicates
+        return idx
 
     def _get_row_index(self, ws, ws_name: str) -> Dict[str, int]:
-        if ws_name not in self._row_index:
-            self._build_row_index(ws, ws_name)
-        return self._row_index[ws_name]
+        with self.lock:
+            if ws_name not in self._row_index:
+                self._refresh_row_index_locked(ws, ws_name)
+            return self._row_index[ws_name]
 
-    def _invalidate_row_index(self, ws_name: str) -> None:
+    def _invalidate_row_index(
+        self, ws_name: str, reset_high_water: bool = False
+    ) -> None:
         """Discard cached index so it is rebuilt on next access."""
-        self._row_index.pop(ws_name, None)
-        self._row_count.pop(ws_name, None)
+        with self.lock:
+            self._row_index.pop(ws_name, None)
+            self._row_snapshots.pop(ws_name, None)
+            self._duplicate_ids.pop(ws_name, None)
+            if reset_high_water:
+                self._row_count.pop(ws_name, None)
+                self._recent_verified_rows.pop(ws_name, None)
+
+    def _remember_verified_row_locked(
+        self, ws_name: str, lead_id: str, row_num: int
+    ) -> None:
+        self._recent_verified_rows.setdefault(ws_name, {})[lead_id] = {
+            "row": row_num,
+            "timestamp": time.monotonic(),
+        }
+
+    def _recover_recent_row_locked(
+        self, ws, ws_name: str, lead_id: str
+    ) -> Optional[int]:
+        """Recover a row hidden by short-lived Sheets read propagation lag."""
+        recent = self._recent_verified_rows.get(ws_name, {}).get(lead_id)
+        if not recent:
+            return None
+        age = time.monotonic() - float(recent.get("timestamp", 0.0))
+        if age > 300:
+            self._recent_verified_rows.get(ws_name, {}).pop(lead_id, None)
+            return None
+        row_num = int(recent["row"])
+        actual_id = str(ws.cell(row_num, ID_COL_INDEX + 1).value or "").strip()
+        if actual_id == lead_id:
+            self._row_index.setdefault(ws_name, {})[lead_id] = row_num
+            self._row_count[ws_name] = max(
+                self._row_count.get(ws_name, 1), row_num
+            )
+            return row_num
+        if not actual_id:
+            # Do not create a second row while Google's point read has not yet
+            # confirmed whether the successful write is visible.
+            raise SheetIntegrityError(
+                f"Recent verified write for lead {lead_id} at '{ws_name}' row "
+                f"{row_num} is temporarily not visible; refusing duplicate insert"
+            )
+        self._recent_verified_rows.get(ws_name, {}).pop(lead_id, None)
+        return None
+
+    def recent_lead_ids(self) -> set[str]:
+        """IDs recently written successfully, for deletion-scan grace."""
+        cutoff = time.monotonic() - 300
+        with self.lock:
+            visible: set[str] = set()
+            for ws_name, leads in self._recent_verified_rows.items():
+                expired = [
+                    lead_id for lead_id, item in leads.items()
+                    if float(item.get("timestamp", 0.0)) < cutoff
+                ]
+                for lead_id in expired:
+                    leads.pop(lead_id, None)
+                visible.update(leads)
+            return visible
+
+    def _verified_row_for_lead_locked(
+        self, ws, ws_name: str, lead_id: str, row_idx: Dict[str, int]
+    ) -> Optional[int]:
+        """Return a row only after column B still contains the requested ID."""
+        if lead_id in self._duplicate_ids.get(ws_name, set()):
+            raise DuplicateLeadIdError(
+                f"Lead {lead_id} occurs more than once in worksheet '{ws_name}'"
+            )
+        row_num = row_idx.get(lead_id)
+        if not row_num:
+            return None
+
+        actual_id = str(ws.cell(row_num, ID_COL_INDEX + 1).value or "").strip()
+        if actual_id == lead_id:
+            return row_num
+
+        # A user changed row positions after our snapshot.  Refresh once under the
+        # same lock and verify again; never write through a stale row number.
+        _log_lead.warning(
+            "SHEET ROW MOVED tab='%s' lead=%s cached_row=%d now_contains=%s; "
+            "refreshing index before update",
+            ws_name, lead_id, row_num, actual_id or "(blank)",
+        )
+        row_idx = self._refresh_row_index_locked(ws, ws_name)
+        if lead_id in self._duplicate_ids.get(ws_name, set()):
+            raise DuplicateLeadIdError(
+                f"Lead {lead_id} occurs more than once in worksheet '{ws_name}'"
+            )
+        row_num = row_idx.get(lead_id)
+        if not row_num:
+            return None
+        actual_id = str(ws.cell(row_num, ID_COL_INDEX + 1).value or "").strip()
+        if actual_id != lead_id:
+            raise SheetIntegrityError(
+                f"Refusing update for lead {lead_id}: worksheet '{ws_name}' "
+                f"row {row_num} contains ID '{actual_id}'"
+            )
+        return row_num
 
     def find_row(self, ws, lead_id: str) -> Optional[int]:
-        """O(1) row lookup via in-memory index (cold start: one get_all_values())."""
-        return self._get_row_index(ws, ws.title).get(str(lead_id))
+        """Find and live-verify a lead row under the row-index lock."""
+        lead_id = str(lead_id).strip()
+        with self.lock:
+            row_idx = self._refresh_row_index_locked(ws, ws.title)
+            return self._verified_row_for_lead_locked(
+                ws, ws.title, lead_id, row_idx
+            )
+
+    @staticmethod
+    def _append_cell_data(value: Any) -> Dict[str, Any]:
+        """Encode a Python value for Sheets API appendCells."""
+        if value is None or value == "":
+            return {}
+        if isinstance(value, bool):
+            extended_value = {"boolValue": value}
+        elif isinstance(value, (int, float)):
+            extended_value = {"numberValue": value}
+        else:
+            extended_value = {"stringValue": str(value)}
+        return {"userEnteredValue": extended_value}
 
     def upsert_row(self, row_data: List[Any], tab_name: str) -> int:
-        ws = self._get_or_create_month_sheet(tab_name)
-        lead_id = str(row_data[ID_COL_INDEX])
-        ws_name = ws.title
+        if len(row_data) != len(COLUMNS):
+            raise ValueError(
+                f"Expected {len(COLUMNS)} sheet columns, got {len(row_data)}"
+            )
+        lead_id = str(row_data[ID_COL_INDEX]).strip()
+        if not lead_id:
+            raise ValueError("Cannot write a sheet row without a lead ID")
+
         with self.lock:
-            row_idx = self._get_row_index(ws, ws_name)
-            row_num = row_idx.get(lead_id)
+            ws = self._get_or_create_month_sheet(tab_name)
+            ws_name = ws.title
+            # Always refresh immediately before a mutation.  This is intentionally
+            # a fresh Sheets read, not a merge with stale in-memory entries.
+            row_idx = self._refresh_row_index_locked(ws, ws_name)
+            row_num = self._verified_row_for_lead_locked(
+                ws, ws_name, lead_id, row_idx
+            )
+            if not row_num:
+                row_num = self._recover_recent_row_locked(
+                    ws, ws_name, lead_id
+                )
             if row_num:
-                ws.update(values=[row_data], range_name=f"A{row_num}")
-                _log_lead.info("SHEET UPDATE row=%d lead=%s tab='%s'", row_num, lead_id, ws_name)
+                snapshot = self._row_snapshots.get(ws_name, [])
+                if row_num <= len(snapshot):
+                    current_row = snapshot[row_num - 1]
+                    row_data[ORDER_NUM_COL_INDEX] = (
+                        current_row[ORDER_NUM_COL_INDEX]
+                        if len(current_row) > ORDER_NUM_COL_INDEX else ""
+                    )
+                    row_data[STATUS_COL_INDEX] = (
+                        current_row[STATUS_COL_INDEX]
+                        if len(current_row) > STATUS_COL_INDEX else ""
+                    )
+                else:
+                    # Only possible during a short-lived stale bulk read after a
+                    # verified write; use targeted reads rather than guessing.
+                    row_data[ORDER_NUM_COL_INDEX] = str(
+                        ws.cell(row_num, ORDER_NUM_COL_INDEX + 1).value or ""
+                    )
+                    row_data[STATUS_COL_INDEX] = str(
+                        ws.cell(row_num, STATUS_COL_INDEX + 1).value or ""
+                    )
+                # Never rewrite identity (B), operator-owned Заказ № (C), or
+                # operator-owned Статус (U) on a retry.  In addition to
+                # preserving manual input, excluding B means a concurrent structural
+                # shift cannot be hidden by our own write; the post-check will still
+                # see the other lead's ID and stop.
+                ws.batch_update(
+                    [
+                        {
+                            "range": f"A{row_num}:A{row_num}",
+                            "values": [[row_data[0]]],
+                        },
+                        {
+                            "range": f"D{row_num}:T{row_num}",
+                            "values": [row_data[3:STATUS_COL_INDEX]],
+                        },
+                    ],
+                    value_input_option="USER_ENTERED",
+                )
+                written_id = str(
+                    ws.cell(row_num, ID_COL_INDEX + 1).value or ""
+                ).strip()
+                if written_id != lead_id:
+                    self._invalidate_row_index(ws_name)
+                    raise SheetIntegrityError(
+                        f"Sheet update verification failed for lead {lead_id} at "
+                        f"'{ws_name}' row {row_num}"
+                    )
+                _log_lead.info(
+                    "SHEET UPDATE row=%d lead=%s tab='%s'", row_num, lead_id, ws_name
+                )
+                self._remember_verified_row_locked(
+                    ws_name, lead_id, row_num
+                )
                 return row_num
 
-            # Use append_rows instead of a position-specific update so that the row
-            # is always placed directly after the last real data row on the sheet,
-            # regardless of whether _row_count is stale (e.g. after an external
-            # manual deletion).  This prevents gaps / empty rows from accumulating.
-            # table_range="A1" anchors the Sheets API table-detection at A1 so that
-            # new rows are always inserted starting from column A, even when many
-            # rows have an empty column A (e.g. leads with no company in AMO).
-            # Without this anchor, the API can mis-detect the table as starting at
-            # column B and write the entire row shifted one column to the right.
-            result = ws.append_rows(
-                [row_data],
-                value_input_option="USER_ENTERED",
-                insert_data_option="INSERT_ROWS",
-                table_range="A1",
+            # appendCells is one atomic Sheets batchUpdate operation that appends
+            # after the sheet's actual last data row.  Unlike values.append it has
+            # no table-anchor detection and no INSERT_ROWS mode, so it cannot
+            # choose row 1 or overwrite a checked-but-shifted target row.
+            ws.client.batch_update(
+                ws.spreadsheet_id,
+                {
+                    "requests": [
+                        {
+                            "appendCells": {
+                                "sheetId": ws.id,
+                                "rows": [
+                                    {
+                                        "values": [
+                                            self._append_cell_data(value)
+                                            for value in row_data
+                                        ]
+                                    }
+                                ],
+                                "fields": "userEnteredValue",
+                            }
+                        }
+                    ]
+                },
             )
-            # Parse the actual row number from the API response:
-            # result["updates"]["updatedRange"] = "SheetName!A51:T51"
-            actual_row: int = self._row_count.get(ws_name, 1) + 1  # safe fallback
-            try:
-                updated_range = result.get("updates", {}).get("updatedRange", "")
-                # Extract the START row from a range like "Sheet1!A51:T51" or "A51:T51"
-                m = re.search(r"[A-Za-z](\d+):", updated_range)
-                if m:
-                    actual_row = int(m.group(1))
-            except Exception:
-                pass  # Keep fallback value
 
-            # Keep index consistent
-            row_idx[lead_id] = actual_row
-            self._row_count[ws_name] = actual_row
-            _log_lead.info("SHEET INSERT row=%d lead=%s tab='%s'", actual_row, lead_id, ws_name)
-            # Apply a dropdown to the status cell of the new row
+            # Verify from a new authoritative snapshot.  Google batchUpdate is
+            # synchronous, but retry a short propagation delay without appending
+            # again.  The ID must occur exactly once before state is updated.
+            actual_row: Optional[int] = None
+            for verify_attempt in range(3):
+                refreshed_values = ws.get_all_values()
+                refreshed_idx = self._refresh_row_index_locked(
+                    ws, ws_name, refreshed_values
+                )
+                if lead_id in self._duplicate_ids.get(ws_name, set()):
+                    raise DuplicateLeadIdError(
+                        f"Atomic append produced/found duplicate lead {lead_id} "
+                        f"in worksheet '{ws_name}'"
+                    )
+                actual_row = refreshed_idx.get(lead_id)
+                if actual_row:
+                    break
+                if verify_attempt < 2:
+                    time.sleep(0.2 * (verify_attempt + 1))
+            if not actual_row:
+                self._invalidate_row_index(ws_name)
+                raise SheetIntegrityError(
+                    f"Atomic append completed but lead {lead_id} was not visible "
+                    f"in authoritative refreshes for worksheet '{ws_name}'"
+                )
+            written_id = str(
+                ws.cell(actual_row, ID_COL_INDEX + 1).value or ""
+            ).strip()
+            if written_id != lead_id:
+                self._invalidate_row_index(ws_name)
+                raise SheetIntegrityError(
+                    f"Atomic append verification failed for lead {lead_id} at "
+                    f"'{ws_name}' row {actual_row}"
+                )
+
+            self._remember_verified_row_locked(
+                ws_name, lead_id, actual_row
+            )
+            _log_lead.info(
+                "SHEET INSERT row=%d lead=%s tab='%s'", actual_row, lead_id, ws_name
+            )
             status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-            self._apply_status_dropdown(ws, f"{status_col_letter}{actual_row}:{status_col_letter}{actual_row}")
+            self._apply_status_dropdown(
+                ws,
+                f"{status_col_letter}{actual_row}:{status_col_letter}{actual_row}",
+            )
             return actual_row
 
-    def update_status(self, lead_id: str, status_name: str, tab_name: str = "") -> None:
-        ws = self._get_or_create_month_sheet(tab_name or datetime.now().strftime("%m.%Y"))
+    def update_status(self, lead_id: str, status_name: str, tab_name: str = "") -> bool:
+        lead_id = str(lead_id).strip()
         with self.lock:
-            row_num = self.find_row(ws, lead_id)
+            ws = self._get_or_create_month_sheet(
+                tab_name or datetime.now().strftime("%m.%Y")
+            )
+            row_idx = self._refresh_row_index_locked(ws, ws.title)
+            try:
+                row_num = self._verified_row_for_lead_locked(
+                    ws, ws.title, lead_id, row_idx
+                )
+            except DuplicateLeadIdError:
+                _log_lead.error(
+                    "SHEET STATUS skipped duplicate lead=%s tab='%s'",
+                    lead_id, ws.title,
+                )
+                return False
             if not row_num:
-                _log_lead.warning("SHEET STATUS — lead %s not found in tab '%s'", lead_id, tab_name)
-                return
-            col = STATUS_COL_INDEX + 1
-            ws.update_cell(row_num, col, status_name)
-            _log_lead.info("SHEET STATUS lead=%s → '%s' (row=%d tab='%s')", lead_id, status_name, row_num, ws.title)
+                _log_lead.warning(
+                    "SHEET STATUS — lead %s not found in tab '%s'", lead_id, tab_name
+                )
+                return False
+            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+            ws.update(
+                values=[[status_name]],
+                range_name=(
+                    f"{status_col_letter}{row_num}:"
+                    f"{status_col_letter}{row_num}"
+                ),
+                value_input_option="USER_ENTERED",
+            )
+            written_id = str(
+                ws.cell(row_num, ID_COL_INDEX + 1).value or ""
+            ).strip()
+            if written_id != lead_id:
+                self._invalidate_row_index(ws.title)
+                raise SheetIntegrityError(
+                    f"Status update verification failed for lead {lead_id}: "
+                    f"'{ws.title}' row {row_num} now contains ID '{written_id}'"
+                )
+            _log_lead.info(
+                "SHEET STATUS lead=%s → '%s' (row=%d tab='%s')",
+                lead_id, status_name, row_num, ws.title,
+            )
+            return True
 
-    def iter_lead_statuses(self, tabs_filter: Optional[set] = None) -> List[Dict[str, str]]:
+    def iter_lead_statuses(self, tabs_filter: Optional[set] = None) -> List[Dict[str, Any]]:
         """Iterate statuses across relevant monthly worksheets.
 
         When ``tabs_filter`` is provided only the named tabs are scanned,
@@ -1070,77 +1573,87 @@ class SheetSync:
         Each returned dict includes a ``tab_name`` key so callers can record
         which sheet each lead lives on.
         """
-        out: List[Dict[str, str]] = []
+        out: List[Dict[str, Any]] = []
 
-        # Refresh worksheet-titles list at most once every 120 s so we don't pay
-        # a metadata round-trip on every 60-second poll cycle.
-        now = time.time()
-        if not self._ws_titles_cache or now - self._ws_titles_ts > 120:
-            try:
-                self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
-                self._ws_titles_cache = [ws.title for ws in self.spreadsheet.worksheets()]
-                self._ws_titles_ts = now
-            except Exception as exc:
-                _log.warning("iter_lead_statuses: could not list worksheets: %s", exc)
-                if not self._ws_titles_cache:
-                    return out
-        all_titles = self._ws_titles_cache
-
-        month_pattern = re.compile(r'^\d{2}\.\d{4}$')  # e.g. "03.2026"
-        tabs_to_scan = [
-            t for t in all_titles
-            if (month_pattern.match(t) or t == self.cfg.GOOGLE_WORKSHEET_NAME)
-            and (tabs_filter is None or t in tabs_filter)
-        ]
+        if tabs_filter is not None:
+            # Active-sheet scans already know exactly which tab they require.
+            # Going through a cached title list could turn a transient metadata
+            # failure/miss into an empty scan and falsely classify every lead as
+            # deleted, so open these tabs directly.
+            tabs_to_scan = sorted(tabs_filter)
+        else:
+            # Unfiltered maintenance scans discover monthly worksheets.  Cache
+            # titles briefly to avoid a metadata round-trip for each archive.
+            now = time.time()
+            if not self._ws_titles_cache or now - self._ws_titles_ts > 120:
+                try:
+                    self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
+                    self._ws_titles_cache = [
+                        ws.title for ws in self.spreadsheet.worksheets()
+                    ]
+                    self._ws_titles_ts = now
+                except Exception as exc:
+                    _log.warning(
+                        "iter_lead_statuses: could not list worksheets: %s", exc
+                    )
+                    if not self._ws_titles_cache:
+                        return out
+            month_pattern = re.compile(r'^\d{2}\.\d{4}$')  # e.g. "03.2026"
+            tabs_to_scan = [
+                title for title in self._ws_titles_cache
+                if month_pattern.match(title)
+                or title == self.cfg.GOOGLE_WORKSHEET_NAME
+            ]
 
         for tab_name in tabs_to_scan:
             try:
-                ws = self._get_or_create_month_sheet(tab_name)
-                # Read once — reuse the same get_all_values() result to both
-                # populate the output list AND refresh the in-memory row index so
-                # that subsequent update_status / find_row calls use correct row
-                # numbers even if the sheet was externally modified since last build.
-                all_vals = ws.get_all_values()
-                if not all_vals:
-                    continue
-                new_idx: Dict[str, int] = {}
-                last_data_row = 0
-                for i, row in enumerate(all_vals):
-                    if any(str(c).strip() for c in row):
-                        last_data_row = i + 1
-                    if i == 0:
-                        continue  # skip header row
-                    if len(row) <= max(ID_COL_INDEX, STATUS_COL_INDEX):
-                        continue
-                    lead_id = str(row[ID_COL_INDEX]).strip()
-                    if not lead_id:
-                        continue
-                    new_idx[lead_id] = i + 1  # 1-based sheet row number
-                    status = str(row[STATUS_COL_INDEX]).strip()
-                    order_number = str(row[ORDER_NUM_COL_INDEX]).strip() if len(row) > ORDER_NUM_COL_INDEX else ""
-                    out.append({
-                        "lead_id": lead_id,
-                        "status": status,
-                        "order_number": order_number,
-                        "tab_name": tab_name,
-                    })
-                # Merge under lock: prefer the authoritative sheet data (new_idx)
-                # for any row already visible in the sheet, but preserve in-memory
-                # entries that were inserted AFTER the get_all_values() call above.
-                # Google Sheets has a short cache/propagation lag — a row appended
-                # by upsert_row may not appear in an immediately subsequent
-                # get_all_values() response, which would wipe the entry from the
-                # index and cause upsert_row to insert a duplicate on the next call.
                 with self.lock:
-                    old_idx = self._row_index.get(tab_name, {})
-                    # Start from old in-memory index, then overwrite with
-                    # authoritative sheet values so row numbers stay correct
-                    # after external edits while still protecting recent inserts.
-                    merged = {**old_idx, **new_idx}
-                    self._row_index[tab_name] = merged
-                    self._row_count[tab_name] = last_data_row
+                    ws = self._get_or_create_month_sheet(tab_name)
+                    # Read and replace the cache while holding the same lock used
+                    # by writers.  Never merge stale entries into a fresh snapshot.
+                    all_vals = ws.get_all_values()
+                    self._refresh_row_index_locked(ws, tab_name, all_vals)
+                    duplicate_ids = set(self._duplicate_ids.get(tab_name, set()))
+
+                    for i, row in enumerate(all_vals):
+                        if i == 0 or len(row) <= ID_COL_INDEX:
+                            continue
+                        lead_id = str(row[ID_COL_INDEX]).strip()
+                        if not lead_id or lead_id in duplicate_ids:
+                            continue
+                        status = (
+                            str(row[STATUS_COL_INDEX]).strip()
+                            if len(row) > STATUS_COL_INDEX else ""
+                        )
+                        order_number = (
+                            str(row[ORDER_NUM_COL_INDEX]).strip()
+                            if len(row) > ORDER_NUM_COL_INDEX else ""
+                        )
+                        out.append({
+                            "lead_id": lead_id,
+                            "status": status,
+                            "order_number": order_number,
+                            "tab_name": tab_name,
+                            "duplicate": False,
+                        })
+
+                    # Include one quarantine marker per duplicate so deletion
+                    # detection still sees the ID, while every AMO action skips it.
+                    for lead_id in sorted(duplicate_ids):
+                        out.append({
+                            "lead_id": lead_id,
+                            "status": "",
+                            "order_number": "",
+                            "tab_name": tab_name,
+                            "duplicate": True,
+                        })
             except Exception as exc:
                 _log.warning("iter_lead_statuses: could not read tab '%s': %s", tab_name, exc)
+                # Filtered scans are used for the active Sheet1 sync.  Returning a
+                # partial/empty result would make _detect_deleted_rows forget valid
+                # leads, so fail the whole cycle instead.
+                if tabs_filter is not None:
+                    raise
         return out
 
 
@@ -1279,6 +1792,9 @@ class SyncService:
         # Deduplication cache: maps "lead_id:status_id" -> timestamp of last processing
         self._webhook_dedup: Dict[str, float] = {}
         self._dedup_lock = threading.Lock()
+        # A lead must be absent from three consecutive successful scans before
+        # it is treated as deleted; one partial Sheets response is not evidence.
+        self._missing_sheet_counts: Dict[str, int] = {}
         self._load_structure_mappings()
         self._load_users()
         self._print_config_warnings()
@@ -1561,6 +2077,13 @@ class SyncService:
         _missed_pushes: List[Dict[str, Any]] = []
 
         for item in rows:
+            if item.get("duplicate"):
+                _log_lead.error(
+                    "BOOTSTRAP skipped duplicate lead=%s tab='%s' until the "
+                    "duplicate rows are resolved manually",
+                    item.get("lead_id"), item.get("tab_name", ""),
+                )
+                continue
             raw_status = item["status"]
             lead_id    = item["lead_id"]
             tab        = item.get("tab_name", "")
@@ -1584,10 +2107,10 @@ class SyncService:
                         lead_id, tab, raw_status, candidate,
                     )
                     try:
-                        self.sheet.update_status(lead_id, candidate, tab)
+                        if self.sheet.update_status(lead_id, candidate, tab):
+                            healed_status = candidate
                     except Exception as exc:
                         _log.warning("BOOTSTRAP heal failed for lead %s: %s", lead_id, exc)
-                    healed_status = candidate
 
             # ── Queue leads whose Заказ № PATCH was never sent to AMO ──
             if (lead_id in _status_no_order
@@ -1727,11 +2250,22 @@ class SyncService:
 
             tab_name = self._tab_for_lead(lead)
             row = build_row(lead, status_display, pipeline_name, responsible_name, staff_mapping)
-            self.sheet.upsert_row(row, tab_name)
-            self.remember_sheet_status(lead_id, status_display)
+            try:
+                self.sheet.upsert_row(row, tab_name)
+            except DuplicateLeadIdError:
+                _log_lead.error(
+                    "INITIAL SYNC skipped duplicate lead=%s tab='%s'",
+                    lead_id, tab_name,
+                )
+                skipped += 1
+                continue
+            actual_sheet_status = str(row[STATUS_COL_INDEX]).strip() or status_display
+            self.remember_sheet_status(lead_id, actual_sheet_status)
             self.remember_lead_tab(lead_id, tab_name)
             self.remember_lead_pipeline(lead_id, pipeline_id)
-            self.remember_sheet_order_number(lead_id, "")
+            self.remember_sheet_order_number(
+                lead_id, str(row[ORDER_NUM_COL_INDEX]).strip()
+            )
             written += 1
 
         self.flush_state()  # Persist all initial sync state in one write
@@ -1788,9 +2322,13 @@ class SyncService:
 
             leads: List[Dict[str, Any]] = []
             page = 1
+            # Only fetch leads updated within CATCH_UP_DAYS to avoid processing the
+            # entire historical backlog of leads stuck in trigger status.
+            _cutoff_ts = int(time.time()) - self.cfg.CATCH_UP_DAYS * 86400
+            _date_filter = f"&filter[updated_at][from]={_cutoff_ts}"
             while True:
                 data = self.amo.get(
-                    f"/api/v4/leads?{ids_param}&with=contacts,companies&limit=250&page={page}"
+                    f"/api/v4/leads?{ids_param}{_date_filter}&with=contacts,companies&limit=250&page={page}"
                 )
                 batch = (data.get("_embedded") or {}).get("leads") or []
                 if not batch:
@@ -1841,8 +2379,18 @@ class SyncService:
                 # Uses the same AMO throttle delay as a safe floor; avoids an extra config key.
                 if written > 0:
                     time.sleep(max(self.cfg.AMO_REQUEST_DELAY_SEC, 0.5))
-                self.sheet.upsert_row(row, tab_name)
-                self.remember_sheet_status(lead_id, current_status_name)
+                try:
+                    self.sheet.upsert_row(row, tab_name)
+                except DuplicateLeadIdError:
+                    _log_lead.error(
+                        "CATCH-UP skipped duplicate lead=%s tab='%s'",
+                        lead_id, tab_name,
+                    )
+                    continue
+                actual_sheet_status = (
+                    str(row[STATUS_COL_INDEX]).strip() or current_status_name
+                )
+                self.remember_sheet_status(lead_id, actual_sheet_status)
                 self.remember_lead_tab(lead_id, tab_name)
                 self.remember_lead_pipeline(lead_id, pipeline_id)
                 actual_order_num = str(row[ORDER_NUM_COL_INDEX]) if len(row) > ORDER_NUM_COL_INDEX else ""
@@ -1887,12 +2435,9 @@ class SyncService:
             except ValueError:
                 pass  # already "MM.YYYY" or some other format
 
-        # Fast path: still in the same month — but guarantee the active tab exists.
-        # If a previous run died mid-rotation (after renaming Sheet1 to the archive
-        # tab but before creating the new Sheet1), the saved month already matches
-        # the current month so we'd normally skip everything.  The _sheets cache
-        # ensures _get_or_create_month_sheet only hits the Sheets API on the first
-        # call after startup; subsequent calls in the same process are O(1).
+        # Fast path: still in the same month — verify the active tab exists, but
+        # never create an empty replacement.  A missing/renamed live tab requires
+        # manual recovery so tracked leads are not mistaken for deleted rows.
         if known_key == current_month:
             try:
                 self.sheet._get_or_create_month_sheet(self.cfg.GOOGLE_WORKSHEET_NAME)
@@ -1907,7 +2452,9 @@ class SyncService:
             # First ever run — nothing to archive, just record the current month
             # and ensure the active tab exists.
             try:
-                self.sheet._get_or_create_month_sheet(main_name)
+                self.sheet._get_or_create_month_sheet(
+                    main_name, allow_create=True
+                )
             except Exception as exc:
                 _log.warning("Could not ensure active tab '%s': %s", main_name, exc)
             with self.state_lock:
@@ -2249,8 +2796,19 @@ class SyncService:
 
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
-                self.sheet.upsert_row(row, tab_name)
-                self.remember_sheet_status(lead_id, current_status_name)
+                try:
+                    self.sheet.upsert_row(row, tab_name)
+                except DuplicateLeadIdError:
+                    skipped_duplicate += 1
+                    _log_wh.error(
+                        "WEBHOOK TRIGGER skipped duplicate lead=%s tab='%s'",
+                        lead_id, tab_name,
+                    )
+                    continue
+                actual_sheet_status = (
+                    str(row[STATUS_COL_INDEX]).strip() or current_status_name
+                )
+                self.remember_sheet_status(lead_id, actual_sheet_status)
                 self.remember_lead_tab(lead_id, tab_name)
                 self.remember_lead_pipeline(lead_id, pipeline_id)
                 _log_wh.info(
@@ -2281,7 +2839,11 @@ class SyncService:
                         lead_id, terminal_name,
                     )
                     continue
-                self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
+                if not self.sheet.update_status(
+                    lead_id, sheet_display, self.get_lead_tab(lead_id)
+                ):
+                    skipped_status_mismatch += 1
+                    continue
                 self.remember_sheet_status(lead_id, sheet_display)
                 self.remember_lead_pipeline(lead_id, lead_pipeline_id)
                 self._set_expiry_for_status(lead_id, sheet_display)
@@ -2298,7 +2860,11 @@ class SyncService:
                     if sheet_display == "Успешно":
                         skipped_status_mismatch += 1
                         continue
-                    self.sheet.update_status(lead_id, sheet_display, self.get_lead_tab(lead_id))
+                    if not self.sheet.update_status(
+                        lead_id, sheet_display, self.get_lead_tab(lead_id)
+                    ):
+                        skipped_status_mismatch += 1
+                        continue
                     self.remember_sheet_status(lead_id, sheet_display)
                     self.remember_lead_pipeline(lead_id, int(full_lead.get("pipeline_id", 0) or 0))
                     self._set_expiry_for_status(lead_id, sheet_display)
@@ -2333,22 +2899,36 @@ class SyncService:
             "configured_terminal_status_ids": self.cfg.STATUS_MAP,
         }
 
-    def _detect_deleted_rows(self, visible_ids: set) -> None:
+    def _detect_deleted_rows(
+        self, visible_ids: set, scanned_tabs: Optional[set] = None
+    ) -> None:
         """Compare leads we track in state against what is visible in the sheet.
 
-        Any lead that our service wrote (has an entry in lead_tab_by_lead) but is
-        no longer present in ANY scanned tab is considered externally deleted.
-        We log a warning with all known details and immediately forget the lead so
-        this message appears exactly once (not on every subsequent poll cycle).
+        Only leads assigned to a successfully scanned tab are considered.  A lead
+        must be absent in three consecutive scans before its tracking state is
+        removed, which avoids treating one partial Sheets response as a deletion.
         """
         with self.state_lock:
             tracked = dict(self.state.get("lead_tab_by_lead", {}))
         for lead_id, tab in tracked.items():
             if lead_id in visible_ids:
+                self._missing_sheet_counts.pop(lead_id, None)
+                continue
+            # An active-only scan says nothing about rows in archive tabs.
+            if scanned_tabs is not None and tab not in scanned_tabs:
                 continue
             # Skip leads that have already passed their expiry — expire_finished_leads
             # will handle those in its own loop.
             if self.is_lead_expired(lead_id):
+                continue
+            missing_count = self._missing_sheet_counts.get(lead_id, 0) + 1
+            self._missing_sheet_counts[lead_id] = missing_count
+            if missing_count < 3:
+                _log_lead.warning(
+                    "SHEET ROW MISSING (confirmation %d/3) — lead=%s tab='%s'; "
+                    "no state was changed",
+                    missing_count, lead_id, tab,
+                )
                 continue
             known_status = self.get_known_sheet_status(lead_id)
             _log_lead.warning(
@@ -2356,8 +2936,9 @@ class SyncService:
                 " — row is no longer present in the sheet",
                 lead_id, tab, known_status or "?",
             )
-            # Forget immediately so this warning fires exactly once, not every poll.
+            # The absence is now confirmed; forget once and clear the counter.
             self.forget_lead(lead_id)
+            self._missing_sheet_counts.pop(lead_id, None)
         self.flush_state()
 
     def sync_sheet_to_amo(self) -> None:
@@ -2366,9 +2947,18 @@ class SyncService:
         # check_and_rotate_sheet(). Old month tabs are never scanned.
         _active_tabs: set = {self.cfg.GOOGLE_WORKSHEET_NAME}
         rows = self.sheet.iter_lead_statuses(tabs_filter=_active_tabs)
-        visible_ids = {item["lead_id"] for item in rows}
-        self._detect_deleted_rows(visible_ids)
+        visible_ids = {
+            item["lead_id"] for item in rows
+        } | self.sheet.recent_lead_ids()
+        self._detect_deleted_rows(visible_ids, scanned_tabs=_active_tabs)
         for item in rows:
+            if item.get("duplicate"):
+                _log_lead.error(
+                    "SHEET→AMO skipped duplicate lead=%s tab='%s' until the "
+                    "duplicate rows are resolved manually",
+                    item.get("lead_id"), item.get("tab_name", ""),
+                )
+                continue
             lead_id = item["lead_id"]
             status_name = item["status"]
             order_number = item.get("order_number", "")
