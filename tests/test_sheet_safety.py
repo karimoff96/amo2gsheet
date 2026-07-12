@@ -17,7 +17,6 @@ os.environ.update({
     "AMO_REDIRECT_URI": "https://localhost/callback",
     "AMO_TOKEN_STORE": "/tmp/amo2gsheet-test-tokens.json",
     "GOOGLE_SHEET_ID": "test-sheet",
-    "GOOGLE_SHEET_OWNER_EMAILS": "owner@example.test",
     "GOOGLE_SERVICE_ACCOUNT_FILE": "/tmp/amo2gsheet-test-service-account.json",
     "KPI_DB_PATH": ":memory:",
     "LOG_DIR": "/tmp/amo2gsheet-test-logs",
@@ -74,35 +73,6 @@ class _FakeClient:
         self.worksheet = worksheet
 
     def fetch_sheet_metadata(self, _spreadsheet_id, params=None):
-        protected_ranges = []
-        if self.worksheet.sheet_protected:
-            protected_ranges.append({
-                "range": {
-                    "sheetId": self.worksheet.id,
-                },
-                "unprotectedRanges": [
-                    {
-                        "sheetId": self.worksheet.id,
-                        "startRowIndex": 1,
-                        "startColumnIndex": subject.ORDER_NUM_COL_INDEX,
-                        "endColumnIndex": subject.ORDER_NUM_COL_INDEX + 1,
-                    },
-                    {
-                        "sheetId": self.worksheet.id,
-                        "startRowIndex": 1,
-                        "startColumnIndex": subject.STATUS_COL_INDEX,
-                        "endColumnIndex": subject.STATUS_COL_INDEX + 1,
-                    },
-                ],
-                "warningOnly": False,
-                "editors": {
-                    "users": self.worksheet.protection_editor_users,
-                    "groups": self.worksheet.protection_editor_groups,
-                    "domainUsersCanEdit": (
-                        self.worksheet.protection_domain_users_can_edit
-                    ),
-                },
-            })
         return {
             "sheets": [
                 {
@@ -113,7 +83,6 @@ class _FakeClient:
                             "frozenRowCount": self.worksheet.frozen_row_count,
                         },
                     },
-                    "protectedRanges": protected_ranges,
                 }
             ]
         }
@@ -121,8 +90,6 @@ class _FakeClient:
     def batch_update(self, _spreadsheet_id, body):
         self.worksheet.api_batch_updates.append(copy.deepcopy(body))
         for request in body.get("requests", []):
-            if "addProtectedRange" in request:
-                self.worksheet.sheet_protected = True
             if "appendCells" in request:
                 if self.worksheet.before_append_cells:
                     callback = self.worksheet.before_append_cells
@@ -148,20 +115,15 @@ class _FakeClient:
 
 
 class _FakeWorksheet:
-    def __init__(self, values, frozen_rows=1, sheet_protected=True):
+    def __init__(self, values, frozen_rows=1):
         self.title = "Sheet1"
         self.id = 101
         self.spreadsheet_id = "spreadsheet"
         self.row_count = 2000
         self.frozen_row_count = frozen_rows
-        self.sheet_protected = sheet_protected
-        self.protection_editor_users = ["bot@example.test"]
-        self.protection_editor_groups = []
-        self.protection_domain_users_can_edit = False
         self.values = copy.deepcopy(values)
         self.get_all_values_results = []
         self.updates = []
-        self.validations = []
         self.cell_values = []
         self.before_batch_update = None
         self.before_append_cells = None
@@ -245,10 +207,6 @@ class _FakeWorksheet:
             self.frozen_row_count = rows
         return {}
 
-    def add_validation(self, cell_range, *_args, **_kwargs):
-        self.validations.append(cell_range)
-
-
 def _sheet_sync(worksheet):
     sync = subject.SheetSync.__new__(subject.SheetSync)
     sync.cfg = SimpleNamespace(
@@ -267,8 +225,6 @@ def _sheet_sync(worksheet):
     sync._recent_verified_rows = {}
     sync._ws_titles_cache = [worksheet.title]
     sync._ws_titles_ts = time.time()
-    sync._service_account_email = "bot@example.test"
-    sync._trusted_protection_editor_users = {"bot@example.test"}
     sync.spreadsheet = SimpleNamespace()
     sync.gc = SimpleNamespace()
     return sync
@@ -341,7 +297,7 @@ class SheetSafetyTests(unittest.TestCase):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
         sync = _sheet_sync(ws)
 
-        # Even an owner override in the validation→append window cannot choose
+        # A structural edit in the integrity-check→append window cannot choose
         # a stale target: appendCells appends after the shifted last row atomically.
         ws.before_append_cells = lambda: ws.values.insert(1, _row("999"))
         self.assertEqual(4, sync.upsert_row(_row("200"), "Sheet1"))
@@ -355,11 +311,13 @@ class SheetSafetyTests(unittest.TestCase):
         ws = _FakeWorksheet([_row("100"), subject.COLUMNS])
         sync = _sheet_sync(ws)
 
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
+        with self.assertLogs("amo2gsheet.leads", level="CRITICAL") as logs:
+            with self.assertRaises(subject.SheetIntegrityError):
+                sync.upsert_row(_row("200"), "Sheet1")
 
         self.assertEqual([], ws.updates)
         self.assertFalse(ws.append_called)
+        self.assertTrue(any("SHEET INTEGRITY BLOCKED" in item for item in logs.output))
 
     def test_unfrozen_exact_header_is_refrozen_before_writing(self):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100")], frozen_rows=0)
@@ -370,125 +328,15 @@ class SheetSafetyTests(unittest.TestCase):
         self.assertEqual(3, written_row)
         self.assertEqual(1, ws.frozen_row_count)
 
-    def test_unprotected_sheet_fails_closed(self):
-        ws = _FakeWorksheet(
-            [subject.COLUMNS, _row("100")], sheet_protected=False
-        )
-        sync = _sheet_sync(ws)
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-        self.assertEqual([], ws.updates)
-
-    def test_google_owner_added_to_protection_metadata_is_accepted(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        # Sheets adds the file owner to the metadata readback even though the
-        # create request explicitly names only the service account.
-        ws.protection_editor_users = ["bot@example.test", "owner@example.test"]
-        sync = _sheet_sync(ws)
-        sync._trusted_protection_editor_users.add("owner@example.test")
-
-        self.assertEqual(3, sync.upsert_row(_row("200"), "Sheet1"))
-
-    def test_protection_editor_normalization_is_accepted(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_editor_users = [
-            " BOT@EXAMPLE.TEST ",
-            " OWNER@EXAMPLE.TEST ",
-        ]
-        sync = _sheet_sync(ws)
-        sync._trusted_protection_editor_users.add("owner@example.test")
-
-        self.assertEqual(3, sync.upsert_row(_row("200"), "Sheet1"))
-
-    def test_unknown_second_protection_editor_fails_closed(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_editor_users = [
-            "bot@example.test", "unexpected-editor@example.test"
-        ]
-        sync = _sheet_sync(ws)
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-        self.assertEqual([], ws.updates)
-
-    def test_additional_protection_editor_fails_closed(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_editor_users = [
-            "bot@example.test",
-            "owner@example.test",
-            "unexpected-editor@example.test",
-        ]
-        sync = _sheet_sync(ws)
-        sync._trusted_protection_editor_users.add("owner@example.test")
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-        self.assertEqual([], ws.updates)
-
-    def test_protection_group_fails_closed(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_editor_groups = ["operators@example.test"]
-        sync = _sheet_sync(ws)
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-    def test_domain_wide_protection_editing_fails_closed(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_domain_users_can_edit = True
-        sync = _sheet_sync(ws)
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-    def test_missing_service_account_protection_editor_fails_closed(self):
-        ws = _FakeWorksheet([subject.COLUMNS, _row("100")])
-        ws.protection_editor_users = ["owner@example.test"]
-        sync = _sheet_sync(ws)
-        sync._trusted_protection_editor_users.add("owner@example.test")
-
-        with self.assertRaises(subject.SheetIntegrityError):
-            sync.upsert_row(_row("200"), "Sheet1")
-
-    def test_new_sheet_gets_exact_whole_sheet_protection_shape(self):
-        ws = _FakeWorksheet([], frozen_rows=0, sheet_protected=False)
+    def test_new_sheet_initialization_writes_only_header_and_freeze(self):
+        ws = _FakeWorksheet([], frozen_rows=0)
         sync = _sheet_sync(ws)
 
         sync._initialize_lead_sheet_locked(ws)
 
-        add_requests = [
-            request["addProtectedRange"]["protectedRange"]
-            for body in ws.api_batch_updates
-            for request in body.get("requests", [])
-            if "addProtectedRange" in request
-        ]
-        self.assertEqual(1, len(add_requests))
-        protected = add_requests[0]
-        self.assertEqual({"sheetId": ws.id}, protected["range"])
-        self.assertEqual(
-            [
-                {
-                    "sheetId": ws.id,
-                    "startRowIndex": 1,
-                    "startColumnIndex": subject.ORDER_NUM_COL_INDEX,
-                    "endColumnIndex": subject.ORDER_NUM_COL_INDEX + 1,
-                },
-                {
-                    "sheetId": ws.id,
-                    "startRowIndex": 1,
-                    "startColumnIndex": subject.STATUS_COL_INDEX,
-                    "endColumnIndex": subject.STATUS_COL_INDEX + 1,
-                },
-            ],
-            protected["unprotectedRanges"],
-        )
-        self.assertEqual(
-            ["bot@example.test"], protected["editors"]["users"]
-        )
+        self.assertEqual([("A1:U1", [subject.COLUMNS])], ws.updates)
+        self.assertEqual(1, ws.frozen_row_count)
+        self.assertEqual([], ws.api_batch_updates)
 
     def test_header_inside_data_rows_fails_closed(self):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100"), subject.COLUMNS])

@@ -14,7 +14,6 @@ import gspread
 import requests
 from env_loader import load_env
 from fastapi import FastAPI, Request
-from gspread.utils import ValidationConditionType
 from dashboard_router import create_dashboard_router
 from kpi_store import KPIStore
 
@@ -152,8 +151,7 @@ class SheetIntegrityError(RuntimeError):
 
     This exception is deliberately fail-closed: callers must not continue with
     a partial scan or attempt to reconstruct the header in-place.  A misplaced
-    header can make the Sheets append API insert at row 1 and can make cached row
-    numbers point at a different lead.
+    header can make cached row numbers point at a different lead.
     """
 
 
@@ -290,11 +288,6 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "gsheet.json").strip()
     GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
     GOOGLE_WORKSHEET_NAME = os.getenv("GOOGLE_WORKSHEET_NAME", "Sheet1").strip()
-    GOOGLE_SHEET_OWNER_EMAILS = frozenset(
-        email.strip().casefold()
-        for email in os.getenv("GOOGLE_SHEET_OWNER_EMAILS", "").split(",")
-        if email.strip()
-    )
 
     TRIGGER_STATUS_ID = int(os.getenv("TRIGGER_STATUS_ID", "0"))
     PIPELINE_ID = int(os.getenv("PIPELINE_ID", "0"))
@@ -343,7 +336,6 @@ def require_env() -> None:
         "AMO_CLIENT_SECRET",
         "AMO_REDIRECT_URI",
         "GOOGLE_SHEET_ID",
-        "GOOGLE_SHEET_OWNER_EMAILS",
     ]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
@@ -707,36 +699,6 @@ class SheetSync:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.gc = gspread.service_account(filename=cfg.GOOGLE_SERVICE_ACCOUNT_FILE)
-        google_credentials = (
-            getattr(self.gc, "auth", None)
-            or getattr(getattr(self.gc, "http_client", None), "auth", None)
-        )
-        self._service_account_email = str(
-            getattr(google_credentials, "service_account_email", "")
-            or ""
-        ).strip()
-        if not self._service_account_email:
-            try:
-                credentials_data = json.loads(
-                    Path(cfg.GOOGLE_SERVICE_ACCOUNT_FILE).read_text(encoding="utf-8")
-                )
-                self._service_account_email = str(
-                    credentials_data.get("client_email", "")
-                ).strip()
-            except Exception:
-                pass
-        if not self._service_account_email:
-            raise RuntimeError(
-                "Google service-account email is required for strict sheet protection"
-            )
-        self._trusted_protection_editor_users = {
-            self._service_account_email.casefold(),
-            *{
-                str(email).strip().casefold()
-                for email in getattr(cfg, "GOOGLE_SHEET_OWNER_EMAILS", set())
-                if str(email).strip()
-            },
-        }
         self.spreadsheet = self.gc.open_by_key(cfg.GOOGLE_SHEET_ID)
         # A re-entrant lock protects worksheet mutations and every read/replace of
         # the row-index caches.  Several public methods call locked helpers, so a
@@ -773,7 +735,6 @@ class SheetSync:
             return {
                 "title": str(getattr(ws, "title", "")),
                 "frozen_rows": int(getattr(ws, "frozen_row_count", 0) or 0),
-                "sheet_protected": False,
             }
         try:
             metadata = fetch_metadata(
@@ -782,64 +743,6 @@ class SheetSync:
             for sheet in metadata.get("sheets", []):
                 props = sheet.get("properties", {})
                 if int(props.get("sheetId", -1)) == int(ws.id):
-                    sheet_protected = False
-                    for protected in sheet.get("protectedRanges", []):
-                        protected_range = protected.get("range") or {}
-                        if int(protected_range.get("sheetId", -1)) != int(ws.id):
-                            continue
-                        protects_whole_sheet = (
-                            int(protected_range.get("startRowIndex", 0) or 0) == 0
-                            and int(protected_range.get("startColumnIndex", 0) or 0) == 0
-                            and "endRowIndex" not in protected_range
-                            and "endColumnIndex" not in protected_range
-                        )
-                        unprotected_ranges = protected.get(
-                            "unprotectedRanges", []
-                        )
-                        unprotected_columns = set()
-                        unprotected_shape_valid = True
-                        for allowed in unprotected_ranges:
-                            if (
-                                int(allowed.get("sheetId", -1)) != int(ws.id)
-                                or int(allowed.get("startRowIndex", -1)) != 1
-                                or "endRowIndex" in allowed
-                            ):
-                                unprotected_shape_valid = False
-                                break
-                            unprotected_columns.add((
-                                int(allowed.get("startColumnIndex", -1)),
-                                int(allowed.get("endColumnIndex", -1)),
-                            ))
-                        expected_unprotected_columns = {
-                            (ORDER_NUM_COL_INDEX, ORDER_NUM_COL_INDEX + 1),
-                            (STATUS_COL_INDEX, STATUS_COL_INDEX + 1),
-                        }
-                        editors = protected.get("editors") or {}
-                        editor_users = {
-                            str(user).strip().casefold()
-                            for user in editors.get("users", [])
-                            if str(user).strip()
-                        }
-                        # Google includes spreadsheet owners in protected-range
-                        # metadata even when addProtectedRange names only the
-                        # service account.  Trust only the configured owner(s),
-                        # never an arbitrary second user.
-                        editors_are_strict = (
-                            editor_users
-                            == self._trusted_protection_editor_users
-                            and not editors.get("groups")
-                            and not editors.get("domainUsersCanEdit", False)
-                        )
-                        if (
-                            protects_whole_sheet
-                            and not protected.get("warningOnly", False)
-                            and unprotected_shape_valid
-                            and len(unprotected_ranges) == 2
-                            and unprotected_columns == expected_unprotected_columns
-                            and editors_are_strict
-                        ):
-                            sheet_protected = True
-                            break
                     return {
                         "title": str(props.get("title", "")),
                         "frozen_rows": int(
@@ -847,7 +750,6 @@ class SheetSync:
                                 "frozenRowCount", 0
                             ) or 0
                         ),
-                        "sheet_protected": sheet_protected,
                     }
         except Exception as exc:
             raise SheetIntegrityError(
@@ -902,17 +804,6 @@ class SheetSync:
                 f"'{live_title}' (sheetId={ws.id})"
             )
 
-        if not live_props.get("sheet_protected", False):
-            _log_lead.critical(
-                "SHEET INTEGRITY BLOCKED tab='%s': strict whole-sheet protection "
-                "with only C2:C and U2:U editable is missing. No rows will be "
-                "read or written.",
-                ws.title,
-            )
-            raise SheetIntegrityError(
-                f"Worksheet '{ws.title}' does not have the required structural protection"
-            )
-
         frozen_rows = int(live_props["frozen_rows"])
         if frozen_rows != 1:
             # Freezing/unfreezing changes metadata only and cannot overwrite lead
@@ -950,49 +841,6 @@ class SheetSync:
         last_col = chr(ord("A") + len(COLUMNS) - 1)
         ws.update(values=[COLUMNS], range_name=f"A1:{last_col}1")
         ws.freeze(rows=1)
-        try:
-            ws.client.batch_update(
-                ws.spreadsheet_id,
-                {
-                    "requests": [
-                        {
-                            "addProtectedRange": {
-                                "protectedRange": {
-                                    "range": {
-                                        "sheetId": ws.id,
-                                    },
-                                    "unprotectedRanges": [
-                                        {
-                                            "sheetId": ws.id,
-                                            "startRowIndex": 1,
-                                            "startColumnIndex": ORDER_NUM_COL_INDEX,
-                                            "endColumnIndex": ORDER_NUM_COL_INDEX + 1,
-                                        },
-                                        {
-                                            "sheetId": ws.id,
-                                            "startRowIndex": 1,
-                                            "startColumnIndex": STATUS_COL_INDEX,
-                                            "endColumnIndex": STATUS_COL_INDEX + 1,
-                                        },
-                                    ],
-                                    "description": (
-                                        "amo2gsheet structural lock; operators may "
-                                        "edit only order number and status"
-                                    ),
-                                    "warningOnly": False,
-                                    "editors": {
-                                        "users": [self._service_account_email],
-                                    },
-                                }
-                            }
-                        }
-                    ]
-                },
-            )
-        except Exception as exc:
-            raise SheetIntegrityError(
-                f"Could not structurally protect new worksheet '{ws.title}': {exc}"
-            ) from exc
         self._invalidate_row_index(ws.title, reset_high_water=True)
         # Verify both writes reached Google before the worksheet becomes usable.
         self._read_validated_values_locked(ws)
@@ -1019,9 +867,6 @@ class SheetSync:
                     self._initialize_lead_sheet_locked(ws)
                 else:
                     self._read_validated_values_locked(ws)
-                # Always clean up stale validation rules from old column positions
-                # and re-apply the dropdown only to the correct status column.
-                self._fix_sheet_validation(ws)
 
             self._sheets[name] = ws
             return ws
@@ -1032,8 +877,9 @@ class SheetSync:
         """Return (and lazily create) the worksheet for the given month tab.
 
         Tab names are typically "MM.YYYY" (e.g. "03.2026").  The sheet is
-        created with column headers, a frozen header row, and a status-column
-        dropdown when it does not yet exist.
+        created with column headers and a frozen header row when it does not yet
+        exist. Existing archive tabs are read and validated without rewriting
+        their validation or protection metadata.
         """
         with self.lock:
             if tab_name in self._sheets:
@@ -1057,8 +903,6 @@ class SheetSync:
                 self._initialize_lead_sheet_locked(ws)
             else:
                 self._read_validated_values_locked(ws)
-            # Always clean up stale validation rules from old column positions.
-            self._fix_sheet_validation(ws)
             self._sheets[tab_name] = ws
             return ws
 
@@ -1082,7 +926,7 @@ class SheetSync:
             # Invalidate row indices for both old and new tab names
             self._invalidate_row_index(main_name, reset_high_water=True)
             self._invalidate_row_index(archive_tab_name, reset_high_water=True)
-            # Create (or re-open) a new active sheet with headers + dropdown
+            # Create (or re-open) a new active sheet with headers and freeze only.
             self._get_or_create_sheet(main_name)
             _log.info("New active worksheet '%s' created for the new month.", main_name)
 
@@ -1114,66 +958,6 @@ class SheetSync:
         except Exception as e:
             _log.warning("Could not load Staff sheet: %s", e)
             return self._staff_cache  # Return stale cache on error rather than empty
-
-    # Statuses that can be chosen from the dropdown in the "Статус" column
-    STATUS_DROPDOWN_OPTIONS = ["В процессе", "У курера", "Успешно", "Отказ"]
-
-    def _clear_column_validation(self, ws, row_range: str) -> None:
-        """Remove any data-validation rule from *row_range*.
-
-        Used to wipe stale dropdown rules left on columns that previously held
-        the status column before new columns were inserted in front of it.
-        """
-        try:
-            body = {
-                "requests": [
-                    {
-                        "setDataValidation": {
-                            "range": __import__('gspread').utils.a1_range_to_grid_range(
-                                row_range, ws.id
-                            ),
-                            # Omitting 'rule' clears any existing validation on the range.
-                        }
-                    }
-                ]
-            }
-            ws.client.batch_update(ws.spreadsheet_id, body)
-        except Exception as e:
-            _log.warning("Could not clear validation on %s: %s", row_range, e)
-
-    def _fix_sheet_validation(self, ws) -> None:
-        """Ensure the status dropdown exists ONLY on the status column.
-
-        Clears any validation rules on all other columns in the data area
-        (rows 2-2000) so that stale dropdown rules left from a previous column
-        layout (e.g. before Продажа в рассрочку / Воронка were added) are
-        removed.  Then (re-)applies the dropdown to the correct status column.
-        """
-        status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-        # Clear every column in the sheet except the status column.
-        for i in range(len(COLUMNS)):
-            if i == STATUS_COL_INDEX:
-                continue
-            col_letter = chr(ord("A") + i)
-            self._clear_column_validation(ws, f"{col_letter}2:{col_letter}2000")
-        # (Re-)apply the correct dropdown on the status column.
-        self._apply_status_dropdown(ws, f"{status_col_letter}2:{status_col_letter}2000")
-
-    def _apply_status_dropdown(self, ws, row_range: str) -> None:
-        """Apply a dropdown validation to the status column for the given row range.
-
-        ``row_range`` should be an A1-notation range for the status column only,
-        e.g. ``"T2:T2000"`` or ``"T5:T5"``.
-        """
-        try:
-            ws.add_validation(
-                row_range,
-                ValidationConditionType.one_of_list,
-                self.STATUS_DROPDOWN_OPTIONS,
-                showCustomUi=True,
-            )
-        except Exception as e:
-            _log.warning("Could not set dropdown validation on %s: %s", row_range, e)
 
     def _all_rows(self, ws) -> List[List[str]]:
         values = ws.get_all_values()
@@ -1511,11 +1295,6 @@ class SheetSync:
             )
             _log_lead.info(
                 "SHEET INSERT row=%d lead=%s tab='%s'", actual_row, lead_id, ws_name
-            )
-            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
-            self._apply_status_dropdown(
-                ws,
-                f"{status_col_letter}{actual_row}:{status_col_letter}{actual_row}",
             )
             return actual_row
 

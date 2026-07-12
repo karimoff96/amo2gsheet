@@ -9,7 +9,7 @@ Type=simple
 User=root
 # Quick tunnel — no account needed. URL is printed to the log on startup.
 # Read the assigned URL with: journalctl -u cloudflared | grep trycloudflare
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://localhost:8000
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000
 
 Restart=always
 RestartSec=5

@@ -369,7 +369,7 @@ systemctl enable --now cloudflared
 
 Your permanent webhook URL will be: `https://webhook.yourdomain.com/webhook/amocrm`
 
-> **No domain?** Use a temporary tunnel for testing: `cloudflared tunnel --url http://localhost:8000`  
+> **No domain?** Use a temporary tunnel for testing: `cloudflared tunnel --url http://127.0.0.1:8000`
 > This gives a random `xxxx.trycloudflare.com` URL that changes on each restart.
 
 ---
