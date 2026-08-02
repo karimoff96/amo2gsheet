@@ -14,8 +14,6 @@ import gspread
 import requests
 from env_loader import load_env
 from fastapi import FastAPI, Request
-from dashboard_router import create_dashboard_router
-from kpi_store import KPIStore
 
 load_env()
 
@@ -79,6 +77,9 @@ _log_wh   = logging.getLogger("amo2gsheet.webhooks")
 _log_amo  = logging.getLogger("amo2gsheet.amo_api")
 
 
+# Canonical lead-sheet schema. Every newly-created lead worksheet is initialized
+# from this list. Add future columns here (preferably at the end); row building,
+# header creation, and column indexes all derive from this single definition.
 COLUMNS = [
     "Компания",
     "ID",
@@ -144,6 +145,18 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
 ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
+
+
+def _column_letter(index: int) -> str:
+    """Return the A1 column letters for a zero-based column index."""
+    if index < 0:
+        raise ValueError("Column index cannot be negative")
+    value = index + 1
+    letters = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 class SheetIntegrityError(RuntimeError):
@@ -218,38 +231,6 @@ AMO_STATUS_TO_SHEET_OVERRIDE: Dict[str, str] = {
     "Раздумье": "Отказ",
     "У курера":  "В процессе",
 }
-
-# ── KPI status groupings (used by KPI store event recording) ─────────────────
-# Consul: the lead enters the consultation step — this is the "Лид" credit.
-KPI_CONSUL_DISPLAY_NAMES: set[str] = {"Консультация"}
-# Zakas: ONLY the first confirmed-order stage entry ("Заказ").
-# В процессе / У курера / Успешно are downstream progress — NOT new sales.
-KPI_ZAKAS_DISPLAY_NAMES: set[str] = {"Заказ"}
-# Dumka: the lead is in a "thinking / hesitating" state.
-KPI_DUMKA_DISPLAY_NAMES: set[str] = {"Раздумье"}
-# Uspeshka: lead was successfully realised (Успешно реализовано).
-KPI_USPESHKA_DISPLAY_NAMES: set[str] = {"Успешно реализовано"}
-# Otkaz: lead was closed without a sale.
-KPI_OTKAZ_FINAL_DISPLAY_NAMES: set[str] = {"Закрыто и не реализовано"}
-
-
-def _extract_staff_code(lead: Dict[str, Any]) -> str:
-    """Extract and normalise Код сотрудника from a lead's custom fields.
-
-    Returns the integer-normalised code string (e.g. '134') or '' if absent.
-    """
-    for cf in (lead.get("custom_fields_values") or []):
-        fname = " ".join((cf.get("field_name") or "").split())
-        if fname == "Код сотрудника":
-            vals = cf.get("values") or []
-            if vals:
-                raw = str(vals[0].get("value", "")).strip()
-                try:
-                    return str(int(raw))
-                except ValueError:
-                    return ""
-    return ""
-
 
 def _parse_leads_created_after(raw: str) -> int:
     """Accept a Unix timestamp integer OR a human-readable date/time string (UTC).
@@ -836,10 +817,23 @@ class SheetSync:
         self._assert_sheet_integrity_locked(ws, all_vals)
         return all_vals
 
+    def _header_matches_schema_locked(self, ws) -> bool:
+        """Check only the header row without applying the full read/write guard."""
+        try:
+            header_values = ws.get(
+                f"A1:{_column_letter(len(COLUMNS) - 1)}1"
+            )
+            return bool(header_values) and list(header_values[0]) == COLUMNS
+        except Exception:
+            # Rotation must remain able to preserve and archive a tab even when
+            # the old tab is partially unreadable. The archive operation itself
+            # does not modify cell data.
+            return False
+
     def _initialize_lead_sheet_locked(self, ws) -> None:
         """Initialize a newly-created (and therefore empty) lead worksheet."""
-        last_col = chr(ord("A") + len(COLUMNS) - 1)
-        ws.update(values=[COLUMNS], range_name=f"A1:{last_col}1")
+        last_col = _column_letter(len(COLUMNS) - 1)
+        ws.update(values=[list(COLUMNS)], range_name=f"A1:{last_col}1")
         ws.freeze(rows=1)
         self._invalidate_row_index(ws.title, reset_high_water=True)
         # Verify both writes reached Google before the worksheet becomes usable.
@@ -872,7 +866,10 @@ class SheetSync:
             return ws
 
     def _get_or_create_month_sheet(
-        self, tab_name: str, allow_create: bool = False
+        self,
+        tab_name: str,
+        allow_create: bool = False,
+        validate_cached: bool = False,
     ):
         """Return (and lazily create) the worksheet for the given month tab.
 
@@ -883,7 +880,19 @@ class SheetSync:
         """
         with self.lock:
             if tab_name in self._sheets:
-                return self._sheets[tab_name]
+                ws = self._sheets[tab_name]
+                # The active tab can be edited externally after it was cached.
+                # Recheck its header so same-month recovery is not bypassed by
+                # the cache. Archived tabs remain fully validated on first open.
+                if (
+                    validate_cached
+                    and tab_name == self.cfg.GOOGLE_WORKSHEET_NAME
+                    and not self._header_matches_schema_locked(ws)
+                ):
+                    # Re-read through the full guard so the failure is logged
+                    # with the exact observed header and remains fail-closed.
+                    self._read_validated_values_locked(ws)
+                return ws
             # Re-fetch spreadsheet metadata to avoid stale cache issues.
             self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
             created = False
@@ -906,29 +915,86 @@ class SheetSync:
             self._sheets[tab_name] = ws
             return ws
 
-    def rotate_to_archive(self, archive_tab_name: str) -> None:
-        """Rename the current active worksheet to archive_tab_name, then create a
-        fresh worksheet with the default name so new-month leads start on a clean tab.
+    def _available_archive_title_locked(
+        self, requested_title: str, active_ws=None
+    ) -> str:
+        """Return a non-conflicting archive title without overwriting a tab."""
+        try:
+            existing = self.spreadsheet.worksheet(requested_title)
+        except gspread.WorksheetNotFound:
+            return requested_title
+
+        if active_ws is not None and int(existing.id) == int(active_ws.id):
+            return requested_title
+
+        for suffix in range(2, 1000):
+            candidate = f"{requested_title} ({suffix})"
+            try:
+                self.spreadsheet.worksheet(candidate)
+            except gspread.WorksheetNotFound:
+                _log.warning(
+                    "Archive tab '%s' already exists; using '%s' to preserve both tabs.",
+                    requested_title,
+                    candidate,
+                )
+                return candidate
+        raise SheetIntegrityError(
+            f"Could not find an available archive title based on '{requested_title}'"
+        )
+
+    def rotate_to_archive(self, archive_tab_name: str) -> str:
+        """Archive the active tab and ensure a canonical fresh active tab.
+
+        The old tab is renamed without validating or rewriting its cell data. This
+        is deliberate: a damaged header must not prevent month rotation, and the
+        archive must remain an untouched recovery copy. The newly-created Sheet1
+        is always initialized from the canonical ``COLUMNS`` list.
+
+        Returns the actual archive title. It can differ from ``archive_tab_name``
+        if a tab with the requested title already exists.
         """
         with self.lock:
+            # Refresh metadata before the title transition so a stale worksheet
+            # cache cannot cause us to rename the wrong tab.
+            self.spreadsheet = self.gc.open_by_key(self.cfg.GOOGLE_SHEET_ID)
             main_name = self.cfg.GOOGLE_WORKSHEET_NAME
-            # Rename the existing active sheet to the archive name
+            actual_archive_name = archive_tab_name
+            ws = None
             try:
                 ws = self.spreadsheet.worksheet(main_name)
-                self._read_validated_values_locked(ws)
-                ws.update_title(archive_tab_name)
-                _log.info("Worksheet '%s' renamed to '%s'", main_name, archive_tab_name)
             except gspread.WorksheetNotFound:
                 _log.warning("Worksheet '%s' not found during rotation — skipping rename", main_name)
+
+            if ws is not None:
+                if not self._header_matches_schema_locked(ws):
+                    _log.warning(
+                        "Worksheet '%s' has a non-canonical header; archiving it "
+                        "unchanged and creating a fresh canonical '%s'.",
+                        main_name,
+                        main_name,
+                    )
+                actual_archive_name = self._available_archive_title_locked(
+                    archive_tab_name, active_ws=ws
+                )
+                ws.update_title(actual_archive_name)
+                _log.info(
+                    "Worksheet '%s' renamed to '%s'",
+                    main_name,
+                    actual_archive_name,
+                )
+
             # Clear the sheet cache so the renamed tab is no longer served as the active sheet
             self._sheets.pop(main_name, None)
             self._sheets.pop(archive_tab_name, None)
+            self._sheets.pop(actual_archive_name, None)
             # Invalidate row indices for both old and new tab names
             self._invalidate_row_index(main_name, reset_high_water=True)
             self._invalidate_row_index(archive_tab_name, reset_high_water=True)
+            self._invalidate_row_index(actual_archive_name, reset_high_water=True)
             # Create (or re-open) a new active sheet with headers and freeze only.
             self._get_or_create_sheet(main_name)
             _log.info("New active worksheet '%s' created for the new month.", main_name)
+            return actual_archive_name
 
     def get_staff_mapping(self) -> Dict[str, str]:
         """Fetch the staff mapping from the 'Staff' sheet (result is cached for STAFF_CACHE_TTL_SEC)."""
@@ -1320,7 +1386,7 @@ class SheetSync:
                     "SHEET STATUS — lead %s not found in tab '%s'", lead_id, tab_name
                 )
                 return False
-            status_col_letter = chr(ord("A") + STATUS_COL_INDEX)
+            status_col_letter = _column_letter(STATUS_COL_INDEX)
             ws.update(
                 values=[[status_name]],
                 range_name=(
@@ -1577,14 +1643,6 @@ class SyncService:
         self._load_structure_mappings()
         self._load_users()
         self._print_config_warnings()
-        # ── KPI event store ──────────────────────────────────────────────────
-        _kpi_db = os.getenv("KPI_DB_PATH", "./data/kpi_events.db")
-        self.kpi_store = KPIStore(
-            db_path=_kpi_db,
-            tz_offset=self.cfg.DISPLAY_TZ_OFFSET,
-            dumka_recovery_days=int(os.getenv("DUMKA_RECOVERY_DAYS", "5")),
-        )
-        _log.info("KPI store initialised at %s", _kpi_db)
 
     def _is_duplicate_webhook(self, lead_id: str, status_id: int) -> bool:
         """Return True if this (lead_id, status_id) was already processed within WEBHOOK_DEDUP_TTL_SEC.
@@ -2214,12 +2272,53 @@ class SyncService:
             except ValueError:
                 pass  # already "MM.YYYY" or some other format
 
-        # Fast path: still in the same month — verify the active tab exists, but
-        # never create an empty replacement.  A missing/renamed live tab requires
-        # manual recovery so tracked leads are not mistaken for deleted rows.
+        # Fast path: still in the same month — verify the active tab exists. If
+        # its schema is damaged, quarantine the tab unchanged and create a fresh
+        # canonical Sheet1 so new lead processing does not stop.
         if known_key == current_month:
             try:
-                self.sheet._get_or_create_month_sheet(self.cfg.GOOGLE_WORKSHEET_NAME)
+                self.sheet._get_or_create_month_sheet(
+                    self.cfg.GOOGLE_WORKSHEET_NAME,
+                    validate_cached=True,
+                )
+            except SheetIntegrityError as exc:
+                main_name = self.cfg.GOOGLE_WORKSHEET_NAME
+                recovery_stamp = datetime.now(tz).strftime("%Y%m%d_%H%M%S")
+                recovery_name = f"{main_name}_CORRUPT_{recovery_stamp}"
+                _log.warning(
+                    "Active worksheet '%s' failed integrity validation (%s); "
+                    "quarantining it as '%s' and creating a canonical replacement.",
+                    main_name,
+                    exc,
+                    recovery_name,
+                )
+                try:
+                    actual_recovery_name = self.sheet.rotate_to_archive(recovery_name)
+                except Exception as recovery_exc:
+                    _log.error(
+                        "Active worksheet recovery failed for '%s': %s",
+                        main_name,
+                        recovery_exc,
+                    )
+                    return
+
+                with self.state_lock:
+                    lead_tabs = self.state.get("lead_tab_by_lead", {})
+                    updated = 0
+                    for lid, tab in lead_tabs.items():
+                        if tab == main_name:
+                            lead_tabs[lid] = actual_recovery_name
+                            updated += 1
+                    if updated:
+                        self._state_dirty = True
+                if updated:
+                    _log.info(
+                        "Updated tab pointer for %d lead(s): '%s' → '%s'",
+                        updated,
+                        main_name,
+                        actual_recovery_name,
+                    )
+                self._save_state()
             except Exception as exc:
                 _log.warning("Could not ensure active tab '%s': %s",
                              self.cfg.GOOGLE_WORKSHEET_NAME, exc)
@@ -2247,7 +2346,7 @@ class SyncService:
         _log.info("Month changed '%s' → '%s': archiving '%s' as '%s'",
                   known_key, current_month, main_name, archive_name)
         try:
-            self.sheet.rotate_to_archive(archive_name)
+            actual_archive_name = self.sheet.rotate_to_archive(archive_name)
         except Exception as exc:
             _log.error("Sheet rotation failed: %s", exc)
             return
@@ -2259,13 +2358,13 @@ class SyncService:
             updated = 0
             for lid, tab in lead_tabs.items():
                 if tab == main_name:
-                    lead_tabs[lid] = archive_name
+                    lead_tabs[lid] = actual_archive_name
                     updated += 1
             if updated:
                 self._state_dirty = True
         if updated:
             _log.info("Updated tab pointer for %d lead(s): '%s' → '%s'",
-                      updated, main_name, archive_name)
+                      updated, main_name, actual_archive_name)
 
         with self.state_lock:
             self.state["active_sheet_month"] = current_month
@@ -2328,136 +2427,6 @@ class SyncService:
             ]
             if enriched:
                 lead.setdefault("_embedded", {})["contacts"] = enriched
-
-    def _record_kpi_event(
-        self, full_lead: Dict[str, Any], webhook_status_id: int
-    ) -> None:
-        """Record a KPI event (consul/zakas/dumka) based on the webhook transition.
-
-        Uses webhook_status_id so we capture the transition that *happened*,
-        even if the lead has since moved to a different status in AMO.
-        """
-        display_name = self.status_id_to_display_name.get(webhook_status_id, "")
-        if not display_name:
-            return
-
-        lead_id = str(full_lead.get("id", "")).strip()
-        if not lead_id:
-            return
-
-        pipeline_id   = int(full_lead.get("pipeline_id", 0) or 0)
-        pipeline_name = self.pipeline_id_to_name.get(pipeline_id, "")
-        budget        = float(full_lead.get("price", 0) or 0)
-
-        # Pipeline keyword filter: only record KPI for sotuv-type pipelines
-        if self.cfg.PIPELINE_KEYWORD:
-            if self.cfg.PIPELINE_KEYWORD not in pipeline_name.lower():
-                return
-
-        try:
-            if display_name in KPI_CONSUL_DISPLAY_NAMES:
-                staff_code = _extract_staff_code(full_lead)
-                if staff_code:
-                    ok = self.kpi_store.record_consul(
-                        lead_id, staff_code, None, pipeline_name, budget
-                    )
-                    if ok:
-                        _log.info("KPI consul  lead=%s staff=%s", lead_id, staff_code)
-
-            elif display_name in KPI_ZAKAS_DISPLAY_NAMES:
-                ok = self.kpi_store.record_zakas(lead_id, None, budget, pipeline_name)
-                if ok:
-                    _log.info("KPI zakas   lead=%s", lead_id)
-
-            elif display_name in KPI_DUMKA_DISPLAY_NAMES:
-                ok = self.kpi_store.record_dumka(lead_id, None, pipeline_name)
-                if ok:
-                    _log.info("KPI dumka   lead=%s", lead_id)
-
-            elif display_name in KPI_USPESHKA_DISPLAY_NAMES:
-                ok = self.kpi_store.record_uspeshka(lead_id, None, budget, pipeline_name)
-                if ok:
-                    _log.info("KPI uspeshka lead=%s budget=%s", lead_id, budget)
-
-            elif display_name in KPI_OTKAZ_FINAL_DISPLAY_NAMES:
-                ok = self.kpi_store.record_otkaz(lead_id, None, pipeline_name)
-                if ok:
-                    _log.info("KPI otkaz   lead=%s", lead_id)
-
-        except Exception as exc:
-            _log.error("KPI error recording event for lead %s: %s", lead_id, exc)
-
-    def run_kpi_backfill(self, date_from: str, date_to: str) -> Dict[str, int]:
-        """Replay AMO events for the given date range and populate the KPI store."""
-        pipeline_keyword = getattr(self.cfg, "PIPELINE_KEYWORD", "").lower()
-        sotuv_pipeline_ids: set[int] = set()
-        if pipeline_keyword:
-            for pid, pname in self.pipeline_id_to_name.items():
-                if pipeline_keyword in pname.lower():
-                    sotuv_pipeline_ids.add(pid)
-
-        all_pipeline_ids = set(self.pipeline_id_to_name.keys())
-        scope = sotuv_pipeline_ids or all_pipeline_ids
-
-        consul_status_ids = set(self.trigger_status_ids)  # КОНСУЛЬТАЦИЯ IDs
-
-        zakas_status_ids: set[int] = {
-            sid
-            for pid in scope
-            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
-            if dname in KPI_ZAKAS_DISPLAY_NAMES
-        }
-        dumka_status_ids: set[int] = {
-            sid
-            for pid in scope
-            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
-            if dname in KPI_DUMKA_DISPLAY_NAMES
-        }
-        uspeshka_status_ids: set[int] = {
-            sid
-            for pid in scope
-            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
-            if dname in KPI_USPESHKA_DISPLAY_NAMES
-        }
-        otkaz_status_ids: set[int] = {
-            sid
-            for pid in scope
-            for dname, sid in self.pipeline_status_display_to_id.get(pid, {}).items()
-            if dname in KPI_OTKAZ_FINAL_DISPLAY_NAMES
-        }
-
-        return self.kpi_store.backfill_from_amo(
-            amo=self.amo,
-            date_from=date_from,
-            date_to=date_to,
-            consul_status_ids=consul_status_ids,
-            zakas_status_ids=zakas_status_ids,
-            dumka_status_ids=dumka_status_ids,
-            sotuv_pipeline_ids=sotuv_pipeline_ids,
-            uspeshka_status_ids=uspeshka_status_ids,
-            otkaz_status_ids=otkaz_status_ids,
-        )
-
-    def run_daily_catchup(self, date_str: str) -> Dict[str, int]:
-        """Re-fetch AMO events for one day and update kpi_events (no snapshot)."""
-        _log.info("[KPI-CATCHUP] Running for %s", date_str)
-        try:
-            counts = self.run_kpi_backfill(date_str, date_str)
-            _log.info("[KPI-CATCHUP] Done for %s: %s", date_str, counts)
-            return counts
-        except Exception as exc:
-            _log.error("[KPI-CATCHUP] Failed for %s: %s", date_str, exc)
-            return {}
-
-    def run_nightly_snapshot(self, date_str: str) -> None:
-        """Re-fetch AMO events then freeze the day into manager_snapshots."""
-        _log.info("[KPI-SNAPSHOT] Starting nightly snapshot for %s", date_str)
-        try:
-            self.run_daily_catchup(date_str)
-            self.kpi_store.create_manager_snapshot(date_str)
-            _log.info("[KPI-SNAPSHOT] Snapshot created for %s", date_str)
-        except Exception as exc:
-            _log.error("[KPI-SNAPSHOT] Failed for %s: %s", date_str, exc)
 
     def process_webhook_leads(self, leads: List[Dict[str, Any]]) -> Dict[str, Any]:
         written = 0
@@ -2535,9 +2504,6 @@ class SyncService:
                 status_id = webhook_status_id
             else:
                 status_id = int(full_lead.get("status_id", 0) or 0)
-
-            # KPI recording uses webhook_status_id so we capture what HAPPENED
-            self._record_kpi_event(full_lead, webhook_status_id)
 
             # Skip leads last updated before the configured cutoff (ignores stale history)
             if self.cfg.LEADS_CREATED_AFTER:
@@ -2945,58 +2911,6 @@ class SyncService:
         self.flush_state()
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-class DashboardContext:
-    """Тонкий read-only фасад над SyncService — всё, что нужно dashboard_router.
-
-    Дашборд никогда не получает прямой доступ к SheetSync: опасные операции
-    Google Sheets (запись, создание листов) инкапсулированы в get_staff_list().
-    """
-
-    def __init__(self, svc: "SyncService") -> None:
-        self.kpi_store               = svc.kpi_store
-        self.amo                     = svc.amo
-        self.cfg                     = svc.cfg
-        # Live references — always reflect the latest AMO structure
-        self.pipeline_id_to_name     = svc.pipeline_id_to_name
-        self.status_id_to_display_name = svc.status_id_to_display_name
-        self._sheet                  = svc.sheet  # private, never exposed directly
-        self._svc                    = svc  # for scheduler-triggered operations
-
-    def run_nightly_snapshot(self, date_str: str) -> None:
-        """Trigger a KPI re-fetch + snapshot freeze for the given date."""
-        self._svc.run_nightly_snapshot(date_str)
-
-    def run_daily_catchup(self, date_str: str) -> Dict[str, int]:
-        """Trigger a KPI re-fetch (no snapshot) for the given date."""
-        return self._svc.run_daily_catchup(date_str)
-
-    def get_staff_list(self) -> Dict[str, Dict]:
-        """Return {code → {code, group, full_name}} read from the Staff worksheet.
-
-        Callers are responsible for caching the result if rapid repeated
-        calls must be avoided (dashboard_router has its own TTL cache).
-        """
-        ws = self._sheet._get_or_create_sheet("Staff")
-        rows = ws.get_all_values()
-        out: Dict[str, Dict] = {}
-        for row in rows[1:]:
-            if len(row) < 3:
-                continue
-            code      = str(row[1]).strip()
-            full_name = str(row[2]).strip()
-            dept      = str(row[3]).strip() if len(row) >= 4 else ""
-            if not full_name or not code:
-                continue
-            info = {"code": code, "group": dept, "full_name": full_name}
-            out[code] = info
-            try:
-                out[str(int(code))] = info
-            except ValueError:
-                pass
-        return out
-
-
 service = SyncService()
 app = FastAPI(title="amoCRM <-> Google Sheets Sync")
 
@@ -3025,10 +2939,6 @@ def _webhook_worker() -> None:
 
 
 threading.Thread(target=_webhook_worker, daemon=True, name="webhook-worker").start()
-
-# Mount staff KPI dashboard via a read-only DashboardContext facade
-# (dashboard_router never touches SheetSync write methods directly)
-app.include_router(create_dashboard_router(DashboardContext(service)))
 
 
 @app.on_event("startup")
@@ -3097,148 +3007,9 @@ def on_startup() -> None:
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    # ── KPI backfill (runs in background so startup is not blocked) ─────────
-    kpi_backfill_date = os.getenv("KPI_BACKFILL_DATE", "").strip()
-    if kpi_backfill_date and not service.kpi_store.is_backfill_done(kpi_backfill_date):
-        def _run_backfill():
-            try:
-                from datetime import date as _date
-                today_str = _date.today().strftime("%Y-%m-%d")
-                _log.info("KPI backfill starting: %s → %s", kpi_backfill_date, today_str)
-                counts = service.run_kpi_backfill(kpi_backfill_date, today_str)
-                service.kpi_store.mark_backfill_done(kpi_backfill_date, today_str)
-                _log.info("KPI backfill complete: %s", counts)
-            except Exception as _exc:
-                _log.error("KPI backfill failed: %s", _exc)
-        threading.Thread(target=_run_backfill, daemon=True).start()
-
-    # ── Twice-daily KPI scheduler ────────────────────────────────────────────
-    # 13:00–14:00: midday live catch-up  (no snapshot, just refreshes kpi_events)
-    # 23:00–00:00: nightly snapshot       (catch-up + freeze into manager_snapshots)
-    # IMPORTANT: Use a SEPARATE file for KPI scheduler state so it never
-    # collides with / overwrites the sync service state in .sync_state.json.
-    _kpi_state_file = os.path.join(os.path.dirname(__file__), ".kpi_sched_state.json")
-
-    def _load_sched_state() -> dict:
-        try:
-            with open(_kpi_state_file) as _f:
-                return json.load(_f)
-        except Exception:
-            return {}
-
-    def _save_sched_state(state: dict) -> None:
-        try:
-            with open(_kpi_state_file, "w") as _f:
-                json.dump(state, _f)
-        except Exception as _exc:
-            _log.warning("Could not save sched state: %s", _exc)
-
-    def _kpi_scheduler() -> None:
-        import datetime as _dt
-        tz_offset = getattr(service.cfg, "DISPLAY_TZ_OFFSET", 5)
-        tz = _dt.timezone(_dt.timedelta(hours=tz_offset))
-        state = _load_sched_state()
-        while True:
-            try:
-                now = _dt.datetime.now(tz)
-                today_str = now.strftime("%Y-%m-%d")
-                hour = now.hour
-
-                if 13 <= hour < 14 and state.get("kpi_midday_done") != today_str:
-                    state["kpi_midday_done"] = today_str
-                    _save_sched_state(state)
-                    threading.Thread(
-                        target=service.run_daily_catchup,
-                        args=(today_str,),
-                        daemon=True,
-                        name="kpi-midday",
-                    ).start()
-
-                if 23 <= hour < 24 and state.get("kpi_nightly_done") != today_str:
-                    state["kpi_nightly_done"] = today_str
-                    _save_sched_state(state)
-                    threading.Thread(
-                        target=service.run_nightly_snapshot,
-                        args=(today_str,),
-                        daemon=True,
-                        name="kpi-nightly",
-                    ).start()
-
-            except Exception as _exc:
-                _log.error("KPI scheduler error: %s", _exc)
-            time.sleep(60)
-
-    threading.Thread(target=_kpi_scheduler, daemon=True, name="kpi-scheduler").start()
-
-
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"status": "ok"}
-
-
-@app.post("/api/kpi/backfill")
-async def kpi_backfill_endpoint(request: Request) -> Dict[str, Any]:
-    """Manually trigger a KPI back-fill for a date range.
-
-    Body JSON: {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}
-    Runs synchronously; may take a while for large date ranges.
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    from datetime import date as _date
-    date_from = (payload.get("date_from") or "").strip()
-    date_to   = (payload.get("date_to")   or _date.today().strftime("%Y-%m-%d")).strip()
-    if not date_from:
-        return {"status": "error", "message": "date_from is required (YYYY-MM-DD)"}
-    try:
-        counts = service.run_kpi_backfill(date_from, date_to)
-        service.kpi_store.mark_backfill_done(date_from, date_to)
-        return {"status": "ok", "date_from": date_from, "date_to": date_to, **counts}
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-
-
-@app.post("/api/kpi/reset")
-async def kpi_reset_endpoint(request: Request) -> Dict[str, Any]:
-    """Wipe ALL KPI data and re-run a full backfill for the given date range.
-
-    Body JSON: {"date_from": "YYYY-MM-DD", "date_to": "YYYY-MM-DD"}
-    WARNING: this deletes every existing KPI event before re-filling.
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    from datetime import date as _date
-    date_from = (payload.get("date_from") or "").strip()
-    date_to   = (payload.get("date_to")   or _date.today().strftime("%Y-%m-%d")).strip()
-    if not date_from:
-        return {"status": "error", "message": "date_from is required (YYYY-MM-DD)"}
-    try:
-        service.kpi_store.clear_all_data()
-        counts = service.run_kpi_backfill(date_from, date_to)
-        service.kpi_store.mark_backfill_done(date_from, date_to)
-        return {"status": "ok", "date_from": date_from, "date_to": date_to, **counts}
-    except Exception as exc:
-        return {"status": "error", "message": str(exc)}
-
-
-@app.get("/api/kpi/raw")
-def kpi_raw_events(
-    date_from: str = "",
-    date_to:   str = "",
-) -> Dict[str, Any]:
-    """Return raw KPI events for a date range (for debugging / audit)."""
-    from datetime import date as _date
-    if not date_from:
-        date_from = _date.today().strftime("%Y-%m-%d")
-    if not date_to:
-        date_to = date_from
-    events = service.kpi_store.get_daily_events(date_from, date_to)
-    return {"date_from": date_from, "date_to": date_to, "count": len(events), "events": events}
-
 
 
 @app.get("/")

@@ -18,7 +18,6 @@ os.environ.update({
     "AMO_TOKEN_STORE": "/tmp/amo2gsheet-test-tokens.json",
     "GOOGLE_SHEET_ID": "test-sheet",
     "GOOGLE_SERVICE_ACCOUNT_FILE": "/tmp/amo2gsheet-test-service-account.json",
-    "KPI_DB_PATH": ":memory:",
     "LOG_DIR": "/tmp/amo2gsheet-test-logs",
 })
 
@@ -115,10 +114,11 @@ class _FakeClient:
 
 
 class _FakeWorksheet:
-    def __init__(self, values, frozen_rows=1):
-        self.title = "Sheet1"
-        self.id = 101
+    def __init__(self, values, frozen_rows=1, title="Sheet1", sheet_id=101, spreadsheet=None):
+        self.title = title
+        self.id = sheet_id
         self.spreadsheet_id = "spreadsheet"
+        self.spreadsheet = spreadsheet
         self.row_count = 2000
         self.frozen_row_count = frozen_rows
         self.values = copy.deepcopy(values)
@@ -207,6 +207,50 @@ class _FakeWorksheet:
             self.frozen_row_count = rows
         return {}
 
+    def update_title(self, title):
+        if self.spreadsheet is not None:
+            self.spreadsheet.rename(self, title)
+        else:
+            self.title = title
+        return {}
+
+
+class _FakeSpreadsheet:
+    def __init__(self, worksheets):
+        self.id = "spreadsheet"
+        self._worksheets = {}
+        self._next_id = 200
+        for worksheet in worksheets:
+            worksheet.spreadsheet = self
+            self._worksheets[worksheet.title] = worksheet
+
+    def worksheet(self, title):
+        try:
+            return self._worksheets[title]
+        except KeyError as exc:
+            raise subject.gspread.WorksheetNotFound(title) from exc
+
+    def add_worksheet(self, title, rows, cols):
+        if title in self._worksheets:
+            raise AssertionError(f"worksheet already exists: {title}")
+        worksheet = _FakeWorksheet(
+            [],
+            frozen_rows=0,
+            title=title,
+            sheet_id=self._next_id,
+            spreadsheet=self,
+        )
+        self._next_id += 1
+        self._worksheets[title] = worksheet
+        return worksheet
+
+    def rename(self, worksheet, title):
+        if title in self._worksheets and self._worksheets[title] is not worksheet:
+            raise AssertionError(f"worksheet already exists: {title}")
+        self._worksheets.pop(worksheet.title, None)
+        worksheet.title = title
+        self._worksheets[title] = worksheet
+
 def _sheet_sync(worksheet):
     sync = subject.SheetSync.__new__(subject.SheetSync)
     sync.cfg = SimpleNamespace(
@@ -230,7 +274,31 @@ def _sheet_sync(worksheet):
     return sync
 
 
+def _rotation_sheet_sync(spreadsheet, worksheet):
+    sync = _sheet_sync(worksheet)
+    sync.spreadsheet = spreadsheet
+    sync.gc = SimpleNamespace(open_by_key=lambda _key: spreadsheet)
+    return sync
+
+
+class _FailingActiveSheet:
+    def __init__(self):
+        self.rotation_names = []
+
+    def _get_or_create_month_sheet(self, _name, **_kwargs):
+        raise subject.SheetIntegrityError("row 1 is not the exact expected header")
+
+    def rotate_to_archive(self, archive_name):
+        self.rotation_names.append(archive_name)
+        return archive_name
+
+
 class SheetSafetyTests(unittest.TestCase):
+    def test_column_letter_supports_schema_growth_after_z(self):
+        self.assertEqual("A", subject._column_letter(0))
+        self.assertEqual("Z", subject._column_letter(25))
+        self.assertEqual("AA", subject._column_letter(26))
+
     def test_append_cells_is_atomic_below_last_nonempty_row(self):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100"), [], _row("200")])
         sync = _sheet_sync(ws)
@@ -338,6 +406,73 @@ class SheetSafetyTests(unittest.TestCase):
         self.assertEqual(1, ws.frozen_row_count)
         self.assertEqual([], ws.api_batch_updates)
 
+    def test_rotation_archives_corrupt_tab_and_creates_canonical_sheet(self):
+        corrupt_header = list(subject.COLUMNS)
+        corrupt_header[0] = ""
+        old_sheet = _FakeWorksheet(
+            [corrupt_header, _row("100")],
+            title="Sheet1",
+        )
+        spreadsheet = _FakeSpreadsheet([old_sheet])
+        sync = _rotation_sheet_sync(spreadsheet, old_sheet)
+
+        archive_title = sync.rotate_to_archive("07.2026")
+
+        self.assertEqual("07.2026", archive_title)
+        archived = spreadsheet.worksheet("07.2026")
+        self.assertEqual(corrupt_header, archived.values[0])
+        self.assertEqual("100", archived.values[1][subject.ID_COL_INDEX])
+
+        active = spreadsheet.worksheet("Sheet1")
+        self.assertEqual(subject.COLUMNS, active.values[0])
+        self.assertEqual(1, active.frozen_row_count)
+
+    def test_rotation_does_not_overwrite_existing_archive_title(self):
+        old_sheet = _FakeWorksheet(
+            [subject.COLUMNS, _row("100")],
+            title="Sheet1",
+        )
+        existing_archive = _FakeWorksheet(
+            [subject.COLUMNS, _row("200")],
+            title="07.2026",
+            sheet_id=102,
+        )
+        spreadsheet = _FakeSpreadsheet([old_sheet, existing_archive])
+        sync = _rotation_sheet_sync(spreadsheet, old_sheet)
+
+        archive_title = sync.rotate_to_archive("07.2026")
+
+        self.assertEqual("07.2026 (2)", archive_title)
+        self.assertEqual("200", spreadsheet.worksheet("07.2026").values[1][subject.ID_COL_INDEX])
+        self.assertEqual("100", spreadsheet.worksheet("07.2026 (2)").values[1][subject.ID_COL_INDEX])
+        self.assertEqual(subject.COLUMNS, spreadsheet.worksheet("Sheet1").values[0])
+
+    def test_same_month_corruption_is_quarantined_and_state_pointer_moves(self):
+        sync = subject.SyncService.__new__(subject.SyncService)
+        current_month = subject.datetime.now(
+            subject.timezone(subject.timedelta(hours=5))
+        ).strftime("%m.%Y")
+        sync.cfg = SimpleNamespace(
+            DISPLAY_TZ_OFFSET=5,
+            GOOGLE_WORKSHEET_NAME="Sheet1",
+        )
+        sync.state_lock = threading.RLock()
+        sync.state = {
+            "active_sheet_month": current_month,
+            "lead_tab_by_lead": {"100": "Sheet1"},
+        }
+        sync._state_dirty = False
+        sync.sheet = _FailingActiveSheet()
+        sync.saved = False
+        sync._save_state = lambda: setattr(sync, "saved", True)
+
+        sync.check_and_rotate_sheet()
+
+        self.assertEqual(1, len(sync.sheet.rotation_names))
+        self.assertIn("_CORRUPT_", sync.sheet.rotation_names[0])
+        self.assertEqual(sync.sheet.rotation_names[0], sync.state["lead_tab_by_lead"]["100"])
+        self.assertTrue(sync.saved)
+
     def test_header_inside_data_rows_fails_closed(self):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100"), subject.COLUMNS])
         sync = _sheet_sync(ws)
@@ -377,6 +512,15 @@ class SheetSafetyTests(unittest.TestCase):
 
         self.assertEqual("U2:U2", ws.updates[-1][0])
         self.assertEqual("Отказ", ws.values[1][subject.STATUS_COL_INDEX])
+
+    def test_removed_dashboard_and_kpi_routes_are_not_mounted(self):
+        routes = {route.path for route in subject.app.routes}
+
+        self.assertIn("/webhook/amocrm", routes)
+        self.assertIn("/health", routes)
+        self.assertNotIn("/dashboard", routes)
+        self.assertNotIn("/api/dashboard/stats", routes)
+        self.assertNotIn("/api/kpi/backfill", routes)
 
 
 if __name__ == "__main__":

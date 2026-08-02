@@ -507,7 +507,7 @@ def import_xlsx(xlsx_path: str, dry_run: bool = False) -> None:
     print(f"   Failed     : {failed}")
     if created:
         print(f"\n[NEXT] Once sync_service.py is running it will detect these leads via webhook")
-        print(f"       or you can trigger a manual snapshot via GET /structure on the service.")
+        print(f"       the normal webhook or the configured initial sync will write them to the Sheet.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

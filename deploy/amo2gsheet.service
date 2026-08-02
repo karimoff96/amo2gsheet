@@ -1,6 +1,6 @@
 [Unit]
 Description=amoCRM <-> Google Sheets Sync
-Documentation=file:///root/amo2gsheet/SETUP_GUIDE.md
+Documentation=file:///root/amo2gsheet/docs/DEVELOPER_GUIDE_UZ.md
 After=network-online.target
 Wants=network-online.target
 # Rate-limit restarts: if it crashes more than 5 times in 60s, stop trying

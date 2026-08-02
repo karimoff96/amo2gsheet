@@ -13,15 +13,11 @@ A lightweight Python service that keeps amoCRM leads and a Google Sheet in sync.
 ```
 amo2gsheet/
 ├── sync_service.py       # Main FastAPI service — webhook receiver + sheet sync worker
-├── dashboard_router.py   # Staff KPI dashboard endpoint
-├── kpi_store.py          # SQLite-backed KPI event store for the dashboard
 ├── env_loader.py         # DEV / PROD environment switching
 ├── setup_sheet.py        # One-time Google Sheet initialiser (headers, dropdowns, Staff tab)
 ├── inspect_amo.py        # Utility: print all pipelines/statuses and custom fields from AMO
 ├── import_xlsx.py        # Bulk importer: push leads from an Excel file into AMO
 ├── prod_check.py         # Pre-deploy readiness checker (no writes, exit 0 if clean)
-├── diag_prod.py          # Production diagnostic: service health, token check, Sheet write test
-├── diag_lead_logs.sh     # Search all log files for a specific lead ID
 ├── run.sh                # Dev launcher (Linux)
 ├── deploy/
 │   ├── deploy.sh            # Full server setup script (run once on fresh VPS)
@@ -30,9 +26,7 @@ amo2gsheet/
 │   ├── cloudflared.service  # systemd unit for Cloudflare Tunnel
 │   └── amo2gsheet.logrotate # logrotate config (daily, 14-day retention)
 ├── docs/
-│   ├── BOT_BEHAVIOR.md      # Full sync logic, column layout, suppression rules reference
-│   ├── SETUP_GUIDE.md       # Step-by-step production setup guide
-│   └── SYNC_LOGIC.md        # Quick-reference for sync flows and key constants
+│   └── DEVELOPER_GUIDE_UZ.md # Unofficial Uzbek handoff guide for the next developer
 ├── requirements.txt
 ├── .env                  # ← YOUR config (never commit)
 ├── .env.example          # Template — copy to .env and fill in
@@ -109,7 +103,8 @@ python -m uvicorn sync_service:app --host 0.0.0.0 --port 8000
 
 ## Production Deployment
 
-See [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) for the full step-by-step guide.
+See [docs/DEVELOPER_GUIDE_UZ.md](docs/DEVELOPER_GUIDE_UZ.md) for the project handoff
+and current sync rules.
 
 **TL;DR** — on a fresh Ubuntu/Debian VPS as root:
 
