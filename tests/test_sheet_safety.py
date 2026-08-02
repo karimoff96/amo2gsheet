@@ -129,6 +129,7 @@ class _FakeWorksheet:
         self.before_append_cells = None
         self.append_called = False
         self.api_batch_updates = []
+        self.validations = []
         self.client = _FakeClient(self)
 
     def get_all_values(self):
@@ -205,6 +206,10 @@ class _FakeWorksheet:
     def freeze(self, rows=None, cols=None):
         if rows is not None:
             self.frozen_row_count = rows
+        return {}
+
+    def add_validation(self, range_name, condition_type, values, **kwargs):
+        self.validations.append((range_name, condition_type, list(values), kwargs))
         return {}
 
     def update_title(self, title):
@@ -294,6 +299,9 @@ class _FailingActiveSheet:
 
 
 class SheetSafetyTests(unittest.TestCase):
+    def test_custom_amo_success_status_is_normalized_to_valid_sheet_status(self):
+        self.assertEqual("Успешно", subject.STATUS_DISPLAY_MAP["uspeshkalar"])
+
     def test_column_letter_supports_schema_growth_after_z(self):
         self.assertEqual("A", subject._column_letter(0))
         self.assertEqual("Z", subject._column_letter(25))
@@ -396,7 +404,7 @@ class SheetSafetyTests(unittest.TestCase):
         self.assertEqual(3, written_row)
         self.assertEqual(1, ws.frozen_row_count)
 
-    def test_new_sheet_initialization_writes_only_header_and_freeze(self):
+    def test_new_sheet_initialization_writes_header_freeze_and_status_dropdown(self):
         ws = _FakeWorksheet([], frozen_rows=0)
         sync = _sheet_sync(ws)
 
@@ -404,6 +412,11 @@ class SheetSafetyTests(unittest.TestCase):
 
         self.assertEqual([("A1:U1", [subject.COLUMNS])], ws.updates)
         self.assertEqual(1, ws.frozen_row_count)
+        self.assertEqual(1, len(ws.validations))
+        self.assertEqual("U2:U2000", ws.validations[0][0])
+        self.assertEqual(
+            list(subject.STATUS_DROPDOWN_OPTIONS), ws.validations[0][2]
+        )
         self.assertEqual([], ws.api_batch_updates)
 
     def test_rotation_archives_corrupt_tab_and_creates_canonical_sheet(self):
@@ -472,6 +485,36 @@ class SheetSafetyTests(unittest.TestCase):
         self.assertIn("_CORRUPT_", sync.sheet.rotation_names[0])
         self.assertEqual(sync.sheet.rotation_names[0], sync.state["lead_tab_by_lead"]["100"])
         self.assertTrue(sync.saved)
+
+    def test_same_month_unavailable_sheet_is_not_quarantined(self):
+        sync = subject.SyncService.__new__(subject.SyncService)
+        current_month = subject.datetime.now(
+            subject.timezone(subject.timedelta(hours=5))
+        ).strftime("%m.%Y")
+        sync.cfg = SimpleNamespace(
+            DISPLAY_TZ_OFFSET=5,
+            GOOGLE_WORKSHEET_NAME="Sheet1",
+        )
+        sync.state_lock = threading.RLock()
+        sync.state = {
+            "active_sheet_month": current_month,
+            "lead_tab_by_lead": {"100": "Sheet1"},
+        }
+        sync._state_dirty = False
+        sync.sheet = _FailingActiveSheet()
+        sync.sheet._get_or_create_month_sheet = (
+            lambda _name, **_kwargs: (_ for _ in ()).throw(
+                subject.SheetUnavailableError("429 quota")
+            )
+        )
+        sync.saved = False
+        sync._save_state = lambda: setattr(sync, "saved", True)
+
+        sync.check_and_rotate_sheet()
+
+        self.assertEqual([], sync.sheet.rotation_names)
+        self.assertEqual("Sheet1", sync.state["lead_tab_by_lead"]["100"])
+        self.assertFalse(sync.saved)
 
     def test_header_inside_data_rows_fails_closed(self):
         ws = _FakeWorksheet([subject.COLUMNS, _row("100"), subject.COLUMNS])

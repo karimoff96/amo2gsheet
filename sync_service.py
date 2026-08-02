@@ -14,6 +14,7 @@ import gspread
 import requests
 from env_loader import load_env
 from fastapi import FastAPI, Request
+from gspread.utils import ValidationConditionType
 
 load_env()
 
@@ -136,6 +137,10 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
     "OTKAZ":                      "Отказ",
     "ОТКАЗ":                      "Отказ",
     "Отказ":                      "Отказ",
+    # Custom terminal status used by the Baza Uspeshno pipeline.  Without this
+    # entry the generic AMO mapper falls back to the raw value "uspeshkalar",
+    # which is not one of the sheet's allowed display statuses.
+    "uspeshkalar":                 "Успешно",
     "Успешно":                    "Успешно",
     "Успешно ":                   "Успешно",
     "Успешно реализовано":        "Успешно",
@@ -145,6 +150,7 @@ STATUS_DISPLAY_MAP: Dict[str, str] = {
 ID_COL_INDEX = COLUMNS.index("ID")
 STATUS_COL_INDEX = COLUMNS.index("Статус")
 ORDER_NUM_COL_INDEX = COLUMNS.index("Заказ №")
+STATUS_DROPDOWN_OPTIONS = ("В процессе", "У курера", "Успешно", "Отказ")
 
 
 def _column_letter(index: int) -> str:
@@ -159,12 +165,23 @@ def _column_letter(index: int) -> str:
     return letters
 
 
+STATUS_COL_LETTER = _column_letter(STATUS_COL_INDEX)
+
+
 class SheetIntegrityError(RuntimeError):
     """Raised when a lead worksheet is not safe to read from or write to.
 
     This exception is deliberately fail-closed: callers must not continue with
     a partial scan or attempt to reconstruct the header in-place.  A misplaced
     header can make cached row numbers point at a different lead.
+    """
+
+
+class SheetUnavailableError(RuntimeError):
+    """Raised when Sheets data cannot be verified because the API is unavailable.
+
+    An unavailable API is not evidence of a damaged worksheet.  Callers must
+    defer integrity recovery until a successful read is possible.
     """
 
 
@@ -733,10 +750,10 @@ class SheetSync:
                         ),
                     }
         except Exception as exc:
-            raise SheetIntegrityError(
+            raise SheetUnavailableError(
                 f"Could not verify frozen header for worksheet '{ws.title}': {exc}"
             ) from exc
-        raise SheetIntegrityError(
+        raise SheetUnavailableError(
             f"Could not find worksheet '{ws.title}' in live spreadsheet metadata"
         )
 
@@ -795,7 +812,7 @@ class SheetSync:
                     self._live_sheet_properties(ws)["frozen_rows"]
                 )
             except Exception as exc:
-                raise SheetIntegrityError(
+                raise SheetUnavailableError(
                     f"Could not restore frozen header for '{ws.title}': {exc}"
                 ) from exc
             if frozen_rows != 1:
@@ -813,7 +830,12 @@ class SheetSync:
 
     def _read_validated_values_locked(self, ws) -> List[List[str]]:
         """Read a worksheet and validate its live safety invariants."""
-        all_vals = ws.get_all_values()
+        try:
+            all_vals = ws.get_all_values()
+        except Exception as exc:
+            raise SheetUnavailableError(
+                f"Could not read worksheet '{ws.title}': {exc}"
+            ) from exc
         self._assert_sheet_integrity_locked(ws, all_vals)
         return all_vals
 
@@ -824,19 +846,36 @@ class SheetSync:
                 f"A1:{_column_letter(len(COLUMNS) - 1)}1"
             )
             return bool(header_values) and list(header_values[0]) == COLUMNS
-        except Exception:
-            # Rotation must remain able to preserve and archive a tab even when
-            # the old tab is partially unreadable. The archive operation itself
-            # does not modify cell data.
-            return False
+        except Exception as exc:
+            # A failed read cannot prove that the header is corrupt.  Defer the
+            # check instead of entering the quarantine path.
+            raise SheetUnavailableError(
+                f"Could not verify header for worksheet '{ws.title}': {exc}"
+            ) from exc
+
+    def _apply_status_validation_locked(self, ws) -> None:
+        """Apply the canonical Status dropdown to every data row."""
+        try:
+            ws.add_validation(
+                f"{STATUS_COL_LETTER}2:{STATUS_COL_LETTER}{max(ws.row_count, 2000)}",
+                ValidationConditionType.one_of_list,
+                STATUS_DROPDOWN_OPTIONS,
+                showCustomUi=True,
+            )
+        except Exception as exc:
+            raise SheetUnavailableError(
+                f"Could not apply Status dropdown to worksheet '{ws.title}': {exc}"
+            ) from exc
 
     def _initialize_lead_sheet_locked(self, ws) -> None:
         """Initialize a newly-created (and therefore empty) lead worksheet."""
         last_col = _column_letter(len(COLUMNS) - 1)
         ws.update(values=[list(COLUMNS)], range_name=f"A1:{last_col}1")
         ws.freeze(rows=1)
+        self._apply_status_validation_locked(ws)
         self._invalidate_row_index(ws.title, reset_high_water=True)
-        # Verify both writes reached Google before the worksheet becomes usable.
+        # Verify the header/freeze writes reached Google before the worksheet is
+        # used.  Validation is metadata-only and is not an integrity signal.
         self._read_validated_values_locked(ws)
 
     def _get_or_create_sheet(self, name: str):
@@ -1756,7 +1795,28 @@ class SyncService:
 
     def _load_state(self) -> Dict[str, Dict[str, str]]:
         if self.state_path.exists():
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            statuses = state.get("sheet_status_by_lead", {})
+            changed = False
+            for lead_id, raw_status in list(statuses.items()):
+                raw_status = str(raw_status or "").strip()
+                normalized_status = (
+                    STATUS_DISPLAY_MAP.get(raw_status)
+                    or _STATUS_DISPLAY_NORMALIZED.get(_normalize_amo_name(raw_status))
+                    or _STATUS_DISPLAY_LOWERED.get(raw_status.lower())
+                )
+                if normalized_status and normalized_status != raw_status:
+                    statuses[lead_id] = normalized_status
+                    changed = True
+            if changed:
+                _log.warning(
+                    "Normalized raw AMO status values in local sync state before startup"
+                )
+                self.state_path.write_text(
+                    json.dumps(state, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return state
         return {"sheet_status_by_lead": {}}
 
     def _save_state(self) -> None:
@@ -2281,6 +2341,14 @@ class SyncService:
                     self.cfg.GOOGLE_WORKSHEET_NAME,
                     validate_cached=True,
                 )
+            except SheetUnavailableError as exc:
+                _log.warning(
+                    "Could not verify active worksheet '%s' (%s); deferring "
+                    "integrity recovery until Sheets is available.",
+                    self.cfg.GOOGLE_WORKSHEET_NAME,
+                    exc,
+                )
+                return
             except SheetIntegrityError as exc:
                 main_name = self.cfg.GOOGLE_WORKSHEET_NAME
                 recovery_stamp = datetime.now(tz).strftime("%Y%m%d_%H%M%S")

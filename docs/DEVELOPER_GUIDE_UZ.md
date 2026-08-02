@@ -141,6 +141,8 @@ Productionda eng muhim qiymatlar:
 - Sheet У курера → AMO dagi muvaffaqiyatli/won statusga o‘tish.
 - Sheet Отказ → pipeline reject statusiga o‘tish.
 - Sheet Успешно → faqat display; AMO ga PATCH qilinmaydi.
+- AMO dagi `uspeshkalar` (Baza Uspeshno pipeline statusi) Sheet ichida `Успешно`
+  ga normalizatsiya qilinadi; xom `uspeshkalar` qiymati status sifatida qoldirilmaydi.
 - Webhook duplicate eventlari WEBHOOK_DEDUP_TTL_SEC ichida tashlab yuboriladi.
 
 ## 8. Tekshirish va loglar
