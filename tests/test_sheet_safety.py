@@ -299,6 +299,116 @@ class _FailingActiveSheet:
 
 
 class SheetSafetyTests(unittest.TestCase):
+    def test_integration_field_and_yes_enum_are_resolved_by_name(self):
+        class _FieldAmo:
+            def get(self, endpoint):
+                self.endpoint = endpoint
+                return {
+                    "_embedded": {
+                        "custom_fields": [
+                            {
+                                "id": 1915779,
+                                "name": "Интеграция",
+                                "type": "select",
+                                "enums": [{"id": 1819213, "value": "Да"}],
+                            }
+                        ]
+                    }
+                }
+
+        sync = subject.SyncService.__new__(subject.SyncService)
+        sync.cfg = SimpleNamespace(
+            INTEGRATION_FIELD_NAME="Интеграция",
+            INTEGRATION_YES_VALUE="Да",
+        )
+        sync.amo = _FieldAmo()
+        sync.integration_field_id = 0
+        sync.integration_yes_enum_id = 0
+
+        sync._resolve_integration_field()
+
+        self.assertEqual("/api/v4/leads/custom_fields?limit=250", sync.amo.endpoint)
+        self.assertEqual(1915779, sync.integration_field_id)
+        self.assertEqual(1819213, sync.integration_yes_enum_id)
+
+    def test_integration_receipt_is_patched_only_after_sheet_write(self):
+        events = []
+
+        class _ReceiptSheet:
+            def upsert_row(self, row, tab_name):
+                events.append(("sheet", row[subject.ID_COL_INDEX], tab_name))
+                return 27
+
+        class _ReceiptAmo:
+            def patch(self, endpoint, body):
+                events.append(("amo", endpoint, copy.deepcopy(body)))
+                return {}
+
+        sync = subject.SyncService.__new__(subject.SyncService)
+        sync.cfg = SimpleNamespace(
+            INTEGRATION_FIELD_NAME="Интеграция",
+            INTEGRATION_YES_VALUE="Да",
+        )
+        sync.sheet = _ReceiptSheet()
+        sync.amo = _ReceiptAmo()
+        sync.integration_field_id = 1915779
+        sync.integration_yes_enum_id = 1819213
+
+        row_number = sync._record_lead_in_sheet("52137713", _row("52137713"), "Sheet1")
+
+        self.assertEqual(27, row_number)
+        self.assertEqual(("sheet", "52137713", "Sheet1"), events[0])
+        self.assertEqual("amo", events[1][0])
+        self.assertEqual("/api/v4/leads/52137713", events[1][1])
+        self.assertEqual(
+            {
+                "custom_fields_values": [
+                    {
+                        "field_id": 1915779,
+                        "values": [{"enum_id": 1819213}],
+                    }
+                ]
+            },
+            events[1][2],
+        )
+
+    def test_failed_sheet_write_does_not_mark_lead_integrated(self):
+        patches = []
+
+        class _FailingReceiptSheet:
+            def upsert_row(self, _row_data, _tab_name):
+                raise subject.SheetUnavailableError("Google 429")
+
+        sync = subject.SyncService.__new__(subject.SyncService)
+        sync.cfg = SimpleNamespace(
+            INTEGRATION_FIELD_NAME="Интеграция",
+            INTEGRATION_YES_VALUE="Да",
+        )
+        sync.sheet = _FailingReceiptSheet()
+        sync.amo = SimpleNamespace(
+            patch=lambda endpoint, body: patches.append((endpoint, body))
+        )
+        sync.integration_field_id = 1915779
+        sync.integration_yes_enum_id = 1819213
+
+        with self.assertRaises(subject.SheetUnavailableError):
+            sync._record_lead_in_sheet("52137713", _row("52137713"), "Sheet1")
+
+        self.assertEqual([], patches)
+
+    def test_failed_webhook_reservation_can_be_retried_immediately(self):
+        sync = subject.SyncService.__new__(subject.SyncService)
+        sync.cfg = SimpleNamespace(WEBHOOK_DEDUP_TTL_SEC=300)
+        sync._webhook_dedup = {}
+        sync._dedup_lock = threading.Lock()
+
+        self.assertFalse(sync._is_duplicate_webhook("52137713", 78235518))
+        self.assertTrue(sync._is_duplicate_webhook("52137713", 78235518))
+
+        sync._release_webhook_dedup("52137713", 78235518)
+
+        self.assertFalse(sync._is_duplicate_webhook("52137713", 78235518))
+
     def test_custom_amo_success_status_is_normalized_to_valid_sheet_status(self):
         self.assertEqual("Успешно", subject.STATUS_DISPLAY_MAP["uspeshkalar"])
 

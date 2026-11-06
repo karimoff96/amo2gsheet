@@ -2,7 +2,7 @@
 
 A lightweight Python service that keeps amoCRM leads and a Google Sheet in sync.
 
-- **AMO → Sheet**: When a lead reaches the trigger status (`ЗАКАЗ БЕЗ НУМЕРАЦИИ`), it is written as a new row with status **"В процессе"**.
+- **AMO → Sheet**: When a lead reaches the trigger status (`ЗАКАЗ БЕЗ НУМЕРАЦИИ`), it is written as a new row with status **"В процессе"**. After Google verifies the row, the amoCRM field **Интеграция** is set to **Да**.
 - **Sheet → AMO**: A background worker polls the sheet every N seconds. When a user fills in **Заказ №**, the order number is written to AMO and the lead moves to `Заказ отправлен`. When the status dropdown changes, the lead moves to the matching pipeline stage.
 - **Multi-pipeline**: Supports multiple parallel sales pipelines. Pipelines are discovered automatically by keyword — no hard-coded IDs needed.
 
@@ -156,6 +156,8 @@ PROD_GOOGLE_SERVICE_ACCOUNT_FILE=prod_gsheet.json
 | `AMO_REQUEST_DELAY_SEC` | | `0.2` | Min seconds between AMO API calls. Raise to `0.5`–`1.0` on prod. |
 | `STAFF_CACHE_TTL_SEC` | | `300` | Seconds to cache the Staff sheet lookup |
 | `WEBHOOK_DEDUP_TTL_SEC` | | `60` | Ignore duplicate (lead, status) webhooks within this window |
+| `INTEGRATION_FIELD_NAME` | | `Интеграция` | amoCRM select field used as the successful Sheet-write receipt |
+| `INTEGRATION_YES_VALUE` | | `Да` | Select option written after Google verifies the lead row |
 | `SYNC_POLL_SECONDS` | | `10` | Seconds between Sheet → AMO sync polls |
 | `SHEET_ROTATION_INTERVAL` | | `monthly` | `monthly` or `hourly` — when to archive the active tab |
 | `INITIAL_SYNC_DATE_FROM` | | — | Bulk-sync AMO leads created from this date (`YYYY-MM-DD`) on startup |
@@ -267,6 +269,10 @@ Build row from lead data:
         │
         ▼
 Upsert row in Google Sheet (update if lead_id exists, append if new)
+        │
+        ▼
+PATCH amoCRM lead: Интеграция = Да
+  (if either operation fails, leave unchecked and allow the resend)
 
 ──────── Background worker (every SYNC_POLL_SECONDS) ────────
 

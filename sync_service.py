@@ -325,6 +325,9 @@ class Config:
     # Hours offset from UTC used when formatting timestamps for display in the Sheet.
     # Uzbekistan / Tashkent = 5 (UTC+5).  Set to 0 for UTC, 3 for Moscow, etc.
     DISPLAY_TZ_OFFSET = float(os.getenv("DISPLAY_TZ_OFFSET", "5"))
+    # AMO receipt written only after a lead row is verified in Google Sheets.
+    INTEGRATION_FIELD_NAME = os.getenv("INTEGRATION_FIELD_NAME", "Интеграция").strip()
+    INTEGRATION_YES_VALUE = os.getenv("INTEGRATION_YES_VALUE", "Да").strip()
 
 
 def require_env() -> None:
@@ -1673,6 +1676,8 @@ class SyncService:
         self.pipeline_id_to_name: Dict[int, str] = {}
         self.status_id_to_display_name: Dict[int, str] = {}
         self.users_map: Dict[int, str] = {}
+        self.integration_field_id: int = 0
+        self.integration_yes_enum_id: int = 0
         # Deduplication cache: maps "lead_id:status_id" -> timestamp of last processing
         self._webhook_dedup: Dict[str, float] = {}
         self._dedup_lock = threading.Lock()
@@ -1681,6 +1686,13 @@ class SyncService:
         self._missing_sheet_counts: Dict[str, int] = {}
         self._load_structure_mappings()
         self._load_users()
+        try:
+            self._resolve_integration_field()
+        except Exception as exc:
+            # Retry lazily on the first lead write.  A transient AMO outage during
+            # startup must never allow a sheet write to be acknowledged without
+            # setting the receipt field.
+            _log.warning("Could not resolve AMO integration receipt field: %s", exc)
         self._print_config_warnings()
 
     def _is_duplicate_webhook(self, lead_id: str, status_id: int) -> bool:
@@ -1699,6 +1711,88 @@ class SyncService:
                 return True
             self._webhook_dedup[key] = now
             return False
+
+    def _release_webhook_dedup(self, lead_id: str, status_id: int) -> None:
+        """Allow an unsuccessful lead event to be retried immediately."""
+        key = f"{lead_id}:{status_id}"
+        with self._dedup_lock:
+            self._webhook_dedup.pop(key, None)
+
+    def _resolve_integration_field(self) -> None:
+        """Resolve the API-only Интеграция select and its Да enum from AMO."""
+        data = self.amo.get("/api/v4/leads/custom_fields?limit=250")
+        fields = (data.get("_embedded") or {}).get("custom_fields") or []
+        wanted_name = self.cfg.INTEGRATION_FIELD_NAME.casefold()
+        wanted_value = self.cfg.INTEGRATION_YES_VALUE.casefold()
+
+        field = next(
+            (
+                item
+                for item in fields
+                if str(item.get("name", "")).strip().casefold() == wanted_name
+            ),
+            None,
+        )
+        if not field:
+            raise RuntimeError(
+                f"AMO lead field '{self.cfg.INTEGRATION_FIELD_NAME}' was not found"
+            )
+        if str(field.get("type", "")).strip().lower() != "select":
+            raise RuntimeError(
+                f"AMO lead field '{self.cfg.INTEGRATION_FIELD_NAME}' must be a select"
+            )
+
+        enum = next(
+            (
+                item
+                for item in (field.get("enums") or [])
+                if str(item.get("value", "")).strip().casefold() == wanted_value
+            ),
+            None,
+        )
+        if not enum:
+            raise RuntimeError(
+                f"AMO lead field '{self.cfg.INTEGRATION_FIELD_NAME}' has no "
+                f"'{self.cfg.INTEGRATION_YES_VALUE}' option"
+            )
+
+        self.integration_field_id = int(field["id"])
+        self.integration_yes_enum_id = int(enum["id"])
+        _log.info(
+            "Resolved AMO receipt field '%s' id=%d enum '%s' id=%d",
+            self.cfg.INTEGRATION_FIELD_NAME,
+            self.integration_field_id,
+            self.cfg.INTEGRATION_YES_VALUE,
+            self.integration_yes_enum_id,
+        )
+
+    def _mark_lead_integrated(self, lead_id: str) -> None:
+        """Acknowledge a lead in AMO after its Sheet row is verified."""
+        if not self.integration_field_id or not self.integration_yes_enum_id:
+            self._resolve_integration_field()
+        self.amo.patch(
+            f"/api/v4/leads/{lead_id}",
+            {
+                "custom_fields_values": [
+                    {
+                        "field_id": self.integration_field_id,
+                        "values": [{"enum_id": self.integration_yes_enum_id}],
+                    }
+                ]
+            },
+        )
+        _log_lead.info(
+            "AMO RECEIPT lead=%s field='%s' value='%s'",
+            lead_id,
+            self.cfg.INTEGRATION_FIELD_NAME,
+            self.cfg.INTEGRATION_YES_VALUE,
+        )
+
+    def _record_lead_in_sheet(self, lead_id: str, row: List[Any], tab_name: str) -> int:
+        """Write and verify the Sheet row, then acknowledge it in AMO."""
+        row_num = self.sheet.upsert_row(row, tab_name)
+        self._mark_lead_integrated(lead_id)
+        return row_num
 
     def _load_users(self) -> None:
         try:
@@ -2148,11 +2242,18 @@ class SyncService:
             tab_name = self._tab_for_lead(lead)
             row = build_row(lead, status_display, pipeline_name, responsible_name, staff_mapping)
             try:
-                self.sheet.upsert_row(row, tab_name)
+                self._record_lead_in_sheet(lead_id, row, tab_name)
             except DuplicateLeadIdError:
                 _log_lead.error(
                     "INITIAL SYNC skipped duplicate lead=%s tab='%s'",
                     lead_id, tab_name,
+                )
+                skipped += 1
+                continue
+            except Exception as exc:
+                _log_lead.error(
+                    "INITIAL SYNC lead=%s was not acknowledged: %s",
+                    lead_id, exc,
                 )
                 skipped += 1
                 continue
@@ -2277,11 +2378,17 @@ class SyncService:
                 if written > 0:
                     time.sleep(max(self.cfg.AMO_REQUEST_DELAY_SEC, 0.5))
                 try:
-                    self.sheet.upsert_row(row, tab_name)
+                    self._record_lead_in_sheet(lead_id, row, tab_name)
                 except DuplicateLeadIdError:
                     _log_lead.error(
                         "CATCH-UP skipped duplicate lead=%s tab='%s'",
                         lead_id, tab_name,
+                    )
+                    continue
+                except Exception as exc:
+                    _log_lead.error(
+                        "CATCH-UP lead=%s was not acknowledged: %s",
+                        lead_id, exc,
                     )
                     continue
                 actual_sheet_status = (
@@ -2610,12 +2717,23 @@ class SyncService:
                 tab_name = self._tab_for_lead(full_lead)
                 row = build_row(full_lead, current_status_name, pipeline_name, responsible_name, staff_mapping)
                 try:
-                    self.sheet.upsert_row(row, tab_name)
+                    self._record_lead_in_sheet(lead_id, row, tab_name)
                 except DuplicateLeadIdError:
+                    self._release_webhook_dedup(lead_id, webhook_status_id)
                     skipped_duplicate += 1
                     _log_wh.error(
                         "WEBHOOK TRIGGER skipped duplicate lead=%s tab='%s'",
                         lead_id, tab_name,
+                    )
+                    continue
+                except Exception as exc:
+                    # The row write and AMO receipt act as one retryable unit.  The
+                    # upsert is idempotent, so a resend can safely verify/update an
+                    # existing row and retry the receipt PATCH.
+                    self._release_webhook_dedup(lead_id, webhook_status_id)
+                    _log_wh.error(
+                        "WEBHOOK TRIGGER lead=%s was not acknowledged: %s",
+                        lead_id, exc,
                     )
                     continue
                 actual_sheet_status = (
